@@ -93,8 +93,7 @@ export class TokenExchangeService {
 		let payload: jwt.JwtPayload;
 		try {
 			const result = jwt.verify(subjectToken, resolvedKey.key, {
-				// EdDSA is valid at runtime but missing from @types/jsonwebtoken
-				algorithms: resolvedKey.algorithms as jwt.Algorithm[],
+				algorithms: resolvedKey.algorithms,
 				issuer: resolvedKey.issuer,
 				audience: resolvedKey.expectedAudience,
 				ignoreExpiration: false,
@@ -149,6 +148,7 @@ export class TokenExchangeService {
 		const user = await this.identityResolutionService.resolve(claims, resolvedKey.allowedRoles, {
 			kid: resolvedKey.kid,
 			issuer: resolvedKey.issuer,
+			requireVerifiedEmail: resolvedKey.requireVerifiedEmail,
 		});
 		return { user, subject: claims.sub, issuer: resolvedKey.issuer, kid: resolvedKey.kid };
 	}
@@ -201,7 +201,7 @@ export class TokenExchangeService {
 			jti: randomUUID(),
 		};
 
-		const accessToken = this.jwtService.sign(payload);
+		const accessToken = this.jwtService.sign('tokenExchange', payload);
 
 		return {
 			accessToken,

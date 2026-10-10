@@ -1,3 +1,6 @@
+import type { Mock } from 'vitest';
+
+import { executeTool, parseToolInput } from '../../__tests__/tool-test-utils';
 import type { OrchestrationContext } from '../../types';
 import { createTaskControlTool } from '../task-control.tool';
 
@@ -10,21 +13,18 @@ function createMockContext(overrides: Partial<OrchestrationContext> = {}): Orche
 		userId: 'user-1',
 		orchestratorAgentId: 'orchestrator-1',
 		modelId: 'test-model',
-		storage: {} as never,
-		subAgentMaxSteps: 10,
 		eventBus: {
-			publish: jest.fn(),
-			subscribe: jest.fn(),
+			publish: vi.fn(),
+			subscribe: vi.fn(),
 		},
-		logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() } as never,
-		domainTools: {},
+		logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as never,
 		abortSignal: new AbortController().signal,
 		taskStorage: {
-			get: jest.fn(),
-			save: jest.fn(),
+			get: vi.fn(),
+			save: vi.fn(),
 		},
-		cancelBackgroundTask: jest.fn(),
-		sendCorrectionToTask: jest.fn(),
+		cancelBackgroundTask: vi.fn(),
+		sendCorrectionToTask: vi.fn(),
 		...overrides,
 	} as unknown as OrchestrationContext;
 }
@@ -32,6 +32,15 @@ function createMockContext(overrides: Partial<OrchestrationContext> = {}): Orche
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 describe('task-control tool', () => {
+	it('describes update-checklist as lightweight and non-scheduler', () => {
+		const tool = createTaskControlTool(createMockContext());
+
+		expect(tool.description).toContain('update-checklist');
+		expect(tool.description).toContain('lightweight visible checklists');
+		expect(tool.description).toContain('do not need scheduler-driven execution');
+		expect(tool.description).toContain('create-tasks');
+	});
+
 	// ── update-checklist ────────────────────────────────────────────────────
 
 	describe('update-checklist action', () => {
@@ -43,7 +52,8 @@ describe('task-control tool', () => {
 			];
 
 			const tool = createTaskControlTool(context);
-			const result = await tool.execute!(
+			const result = await executeTool(
+				tool,
 				{ action: 'update-checklist' as const, tasks },
 				{} as never,
 			);
@@ -62,7 +72,8 @@ describe('task-control tool', () => {
 			const context = createMockContext();
 
 			const tool = createTaskControlTool(context);
-			const result = await tool.execute!(
+			const result = await executeTool(
+				tool,
 				{ action: 'update-checklist' as const, tasks: [] },
 				{} as never,
 			);
@@ -80,7 +91,8 @@ describe('task-control tool', () => {
 			const context = createMockContext();
 
 			const tool = createTaskControlTool(context);
-			const result = await tool.execute!(
+			const result = await executeTool(
+				tool,
 				{ action: 'cancel-task' as const, taskId: 'build-ABC123' },
 				{} as never,
 			);
@@ -95,7 +107,8 @@ describe('task-control tool', () => {
 			});
 
 			const tool = createTaskControlTool(context);
-			const result = await tool.execute!(
+			const result = await executeTool(
+				tool,
 				{ action: 'cancel-task' as const, taskId: 'build-XYZ' },
 				{} as never,
 			);
@@ -111,10 +124,11 @@ describe('task-control tool', () => {
 	describe('correct-task action', () => {
 		it('should send correction and return success message', async () => {
 			const context = createMockContext();
-			(context.sendCorrectionToTask as jest.Mock).mockReturnValue('queued');
+			(context.sendCorrectionToTask as Mock).mockReturnValue('queued');
 
 			const tool = createTaskControlTool(context);
-			const result = await tool.execute!(
+			const result = await executeTool(
+				tool,
 				{
 					action: 'correct-task' as const,
 					taskId: 'build-ABC',
@@ -136,10 +150,11 @@ describe('task-control tool', () => {
 
 		it('should return task-not-found message when task does not exist', async () => {
 			const context = createMockContext();
-			(context.sendCorrectionToTask as jest.Mock).mockReturnValue('task-not-found');
+			(context.sendCorrectionToTask as Mock).mockReturnValue('task-not-found');
 
 			const tool = createTaskControlTool(context);
-			const result = await tool.execute!(
+			const result = await executeTool(
+				tool,
 				{
 					action: 'correct-task' as const,
 					taskId: 'build-GONE',
@@ -155,10 +170,11 @@ describe('task-control tool', () => {
 
 		it('should return task-completed message when task has finished', async () => {
 			const context = createMockContext();
-			(context.sendCorrectionToTask as jest.Mock).mockReturnValue('task-completed');
+			(context.sendCorrectionToTask as Mock).mockReturnValue('task-completed');
 
 			const tool = createTaskControlTool(context);
-			const result = await tool.execute!(
+			const result = await executeTool(
+				tool,
 				{
 					action: 'correct-task' as const,
 					taskId: 'build-DONE',
@@ -180,7 +196,8 @@ describe('task-control tool', () => {
 			});
 
 			const tool = createTaskControlTool(context);
-			const result = await tool.execute!(
+			const result = await executeTool(
+				tool,
 				{
 					action: 'correct-task' as const,
 					taskId: 'build-ABC',
@@ -192,6 +209,42 @@ describe('task-control tool', () => {
 			expect(result).toEqual({
 				result: 'Error: correction delivery not available.',
 			});
+		});
+	});
+});
+
+describe('task-control tool — checklist item contract', () => {
+	function checklistInput(description: string) {
+		return {
+			action: 'update-checklist',
+			tasks: [{ id: 'task-1', description, status: 'todo' }],
+		};
+	}
+
+	it('accepts a checklist item with a description', () => {
+		const tool = createTaskControlTool(createMockContext());
+
+		const parsed = parseToolInput(tool, checklistInput('Create the Users data table'));
+
+		expect(parsed.success).toBe(true);
+	});
+
+	it('rejects a checklist item whose description is blank', () => {
+		const tool = createTaskControlTool(createMockContext());
+
+		const parsed = parseToolInput(tool, checklistInput('  '));
+
+		expect(parsed.success).toBe(false);
+	});
+
+	it('trims surrounding whitespace off the description', () => {
+		const tool = createTaskControlTool(createMockContext());
+
+		const parsed = parseToolInput(tool, checklistInput('\nCreate the Users data table\n'));
+
+		expect(parsed.success).toBe(true);
+		expect(parsed.success && parsed.data).toMatchObject({
+			tasks: [{ description: 'Create the Users data table' }],
 		});
 	});
 });

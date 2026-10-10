@@ -1,19 +1,23 @@
 import { removePreviewToken } from '@/features/shared/nodeCreator/nodeCreator.utils';
-import type { IWorkflowDb } from '@/Interface';
 import { useCommunityNodesStore } from '../communityNodes.store';
 import { useCredentialsStore } from '@/features/credentials/credentials.store';
 import { useNodeTypesStore } from '@/app/stores/nodeTypes.store';
-import { useUsersStore } from '@/features/settings/users/users.store';
+import { useUsersStore } from '@n8n/stores/users.store';
 import { useWorkflowsStore } from '@/app/stores/workflows.store';
-import { useSettingsStore } from '@/app/stores/settings.store';
+import {
+	useWorkflowDocumentStore,
+	createWorkflowDocumentId,
+} from '@/app/stores/workflowDocument.store';
+import { useSettingsStore } from '@n8n/stores/settings.store';
+import { useTypeAvailabilityPoliciesStore } from '@n8n/frontend-module-type-availability-policies';
 import type { CommunityNodeType } from '@n8n/api-types';
 import { createTestingPinia } from '@pinia/testing';
-import type { INode } from 'n8n-workflow';
 import { setActivePinia } from 'pinia';
 import { useCanvasOperations } from '@/app/composables/useCanvasOperations';
 import { useInstallNode } from './useInstallNode';
-import { useToast } from '@/app/composables/useToast';
-import { useTelemetry } from '@/app/composables/useTelemetry';
+import { useToast } from '@n8n/composables/useToast';
+import { useTelemetry } from '@n8n/composables/useTelemetry';
+import { DEFAULT_SETTINGS } from '@/app/constants/workflows';
 
 vi.mock('@/app/composables/useCanvasOperations', () => ({
 	useCanvasOperations: vi.fn().mockReturnValue({
@@ -21,14 +25,14 @@ vi.mock('@/app/composables/useCanvasOperations', () => ({
 	}),
 }));
 
-vi.mock('@/app/composables/useToast', () => ({
+vi.mock('@n8n/composables/useToast', () => ({
 	useToast: vi.fn().mockReturnValue({
 		showError: vi.fn(),
 		showMessage: vi.fn(),
 	}),
 }));
 
-vi.mock('@/app/composables/useTelemetry', () => {
+vi.mock('@n8n/composables/useTelemetry', () => {
 	const track = vi.fn();
 	return {
 		useTelemetry: () => {
@@ -66,7 +70,7 @@ const showError = vi.fn();
 const showMessage = vi.fn();
 
 beforeEach(() => {
-	const pinia = createTestingPinia();
+	const pinia = createTestingPinia({ stubActions: false });
 	setActivePinia(pinia);
 
 	nodeTypesStore = useNodeTypesStore(pinia);
@@ -102,11 +106,12 @@ beforeEach(() => {
 		writable: true,
 	});
 
-	vi.mocked(communityNodesStore.installPackage).mockResolvedValue(undefined);
-	vi.mocked(nodeTypesStore.getNodeTypes).mockResolvedValue(undefined);
-	vi.mocked(nodeTypesStore.fetchCommunityNodePreviews).mockResolvedValue(undefined);
-	vi.mocked(credentialsStore.fetchCredentialTypes).mockResolvedValue(undefined);
-	vi.mocked(nodeTypesStore.getCommunityNodeAttributes).mockResolvedValue({
+	vi.spyOn(communityNodesStore, 'installPackage').mockResolvedValue(undefined);
+	vi.spyOn(nodeTypesStore, 'getNodeTypes').mockResolvedValue(undefined);
+	vi.spyOn(nodeTypesStore, 'fetchCommunityNodePreviews').mockResolvedValue(undefined);
+	vi.spyOn(credentialsStore, 'fetchCredentialTypes').mockResolvedValue(undefined);
+	vi.spyOn(useTypeAvailabilityPoliciesStore(pinia), 'reload').mockResolvedValue(undefined);
+	vi.spyOn(nodeTypesStore, 'getCommunityNodeAttributes').mockResolvedValue({
 		npmVersion: '1.0.0',
 		authorGithubUrl: 'https://github.com/test',
 		authorName: 'Test Author',
@@ -122,7 +127,9 @@ beforeEach(() => {
 		version: '1.0.0',
 	} as unknown as CommunityNodeType);
 
-	workflowsStore.workflow = {
+	workflowsStore.workflowId = 'test-workflow';
+	const workflowDocumentStore = useWorkflowDocumentStore(createWorkflowDocumentId('test-workflow'));
+	workflowDocumentStore.hydrate({
 		id: 'test-workflow',
 		name: 'Test Workflow',
 		active: false,
@@ -131,12 +138,11 @@ beforeEach(() => {
 		updatedAt: new Date().toISOString(),
 		nodes: [],
 		connections: {},
-		settings: {},
-		staticData: {},
+		settings: { ...DEFAULT_SETTINGS },
 		tags: [],
-		triggerCount: 0,
 		versionId: '1',
-	} as unknown as IWorkflowDb;
+		activeVersionId: '1',
+	});
 
 	vi.clearAllMocks();
 });
@@ -198,11 +204,7 @@ describe('useInstallNode', () => {
 			});
 
 			expect(result.success).toBe(true);
-			expect(communityNodesStore.installPackage).toHaveBeenCalledWith(
-				'test-package',
-				true,
-				'1.0.0',
-			);
+			expect(communityNodesStore.installPackage).toHaveBeenCalledWith('test-package', '1.0.0');
 		});
 
 		it('should install verified node with npm version', async () => {
@@ -215,14 +217,11 @@ describe('useInstallNode', () => {
 			});
 
 			expect(result.success).toBe(true);
-			expect(communityNodesStore.installPackage).toHaveBeenCalledWith(
-				'test-package',
-				true,
-				'1.0.0',
-			);
+			expect(communityNodesStore.installPackage).toHaveBeenCalledWith('test-package', '1.0.0');
 			expect(nodeTypesStore.getNodeTypes).toHaveBeenCalled();
 			expect(nodeTypesStore.fetchCommunityNodePreviews).toHaveBeenCalled();
 			expect(credentialsStore.fetchCredentialTypes).toHaveBeenCalledWith(true);
+			expect(useTypeAvailabilityPoliciesStore().reload).toHaveBeenCalled();
 			expect(showMessage).toHaveBeenCalledWith({
 				title: 'settings.communityNodes.messages.install.success',
 				type: 'success',
@@ -244,11 +243,7 @@ describe('useInstallNode', () => {
 
 			expect(result.success).toBe(true);
 			expect(nodeTypesStore.getCommunityNodeAttributes).toHaveBeenCalledWith('test-node');
-			expect(communityNodesStore.installPackage).toHaveBeenCalledWith(
-				'test-package',
-				true,
-				'1.0.0',
-			);
+			expect(communityNodesStore.installPackage).toHaveBeenCalledWith('test-package', '1.0.0');
 		});
 
 		it('should install verified node as latest when unverified packages are enabled', async () => {
@@ -308,7 +303,7 @@ describe('useInstallNode', () => {
 					type: 'test-node',
 					name: 'Node 1',
 					typeVersion: 1,
-					position: [100, 100] as [number, number],
+					position: [128, 128] as [number, number],
 					parameters: {},
 				},
 				{
@@ -316,11 +311,12 @@ describe('useInstallNode', () => {
 					type: 'other-node',
 					name: 'Node 2',
 					typeVersion: 1,
-					position: [200, 200] as [number, number],
+					position: [256, 256] as [number, number],
 					parameters: {},
 				},
 			];
-			workflowsStore.workflow.nodes = mockNodes as INode[];
+			const store = useWorkflowDocumentStore(createWorkflowDocumentId('test-workflow'));
+			store.setNodes(mockNodes);
 
 			const { installNode } = useInstallNode();
 
@@ -337,23 +333,23 @@ describe('useInstallNode', () => {
 					type: 'test-node',
 					name: 'Node 1',
 					typeVersion: 1,
-					position: [100, 100] as [number, number],
+					position: [128, 128] as [number, number],
 					parameters: {},
 				},
 			]);
 		});
 
 		it('should not initialize nodes when nodeType is not provided', async () => {
-			workflowsStore.workflow.nodes = [
+			useWorkflowDocumentStore(createWorkflowDocumentId('test-workflow')).setNodes([
 				{
 					id: 'node-1',
 					type: 'test-node',
 					name: 'Node 1',
 					typeVersion: 1,
-					position: [100, 100] as [number, number],
+					position: [128, 128] as [number, number],
 					parameters: {},
 				},
-			] as INode[];
+			]);
 
 			const { installNode } = useInstallNode();
 
@@ -366,7 +362,7 @@ describe('useInstallNode', () => {
 		});
 
 		it('should not initialize nodes when workflow has no nodes', async () => {
-			workflowsStore.workflow.nodes = [];
+			useWorkflowDocumentStore(createWorkflowDocumentId('test-workflow')).setNodes([]);
 
 			const { installNode } = useInstallNode();
 
@@ -399,6 +395,31 @@ describe('useInstallNode', () => {
 			);
 		});
 
+		it('should show the dedicated title when the package requires an unsupported node API version', async () => {
+			const error = Object.assign(
+				new Error('This community node requires n8n node API version 3.'),
+				{
+					httpStatusCode: 400,
+					meta: { requiredNodesApiVersion: '3', supportedNodesApiVersion: '1' },
+				},
+			);
+			vi.mocked(communityNodesStore.installPackage).mockRejectedValue(error);
+
+			const { installNode } = useInstallNode();
+
+			const result = await installNode({
+				type: 'verified',
+				packageName: 'test-package',
+				nodeType: 'test-node',
+			});
+
+			expect(result.success).toBe(false);
+			expect(showError).toHaveBeenCalledWith(
+				error,
+				'settings.communityNodes.messages.install.incompatible.title',
+			);
+		});
+
 		it('should handle getNpmVersion returning undefined', async () => {
 			vi.mocked(nodeTypesStore.getCommunityNodeAttributes).mockResolvedValue(null);
 
@@ -411,11 +432,7 @@ describe('useInstallNode', () => {
 			});
 
 			expect(result.success).toBe(true);
-			expect(communityNodesStore.installPackage).toHaveBeenCalledWith(
-				'test-package',
-				true,
-				undefined,
-			);
+			expect(communityNodesStore.installPackage).toHaveBeenCalledWith('test-package', undefined);
 		});
 
 		it('should handle getNpmVersion errors', async () => {
@@ -537,11 +554,7 @@ describe('useInstallNode', () => {
 			});
 
 			expect(nodeTypesStore.getCommunityNodeAttributes).toHaveBeenCalledWith('test-node');
-			expect(communityNodesStore.installPackage).toHaveBeenCalledWith(
-				'test-package',
-				true,
-				'2.0.0',
-			);
+			expect(communityNodesStore.installPackage).toHaveBeenCalledWith('test-package', '2.0.0');
 		});
 	});
 
@@ -553,7 +566,7 @@ describe('useInstallNode', () => {
 					type: 'preview:test-node',
 					name: 'Node 1',
 					typeVersion: 1,
-					position: [100, 100] as [number, number],
+					position: [128, 128] as [number, number],
 					parameters: {},
 				},
 				{
@@ -561,7 +574,7 @@ describe('useInstallNode', () => {
 					type: 'test-node',
 					name: 'Node 2',
 					typeVersion: 1,
-					position: [200, 200] as [number, number],
+					position: [256, 256] as [number, number],
 					parameters: {},
 				},
 				{
@@ -569,11 +582,12 @@ describe('useInstallNode', () => {
 					type: 'other-node',
 					name: 'Node 3',
 					typeVersion: 1,
-					position: [300, 300] as [number, number],
+					position: [384, 384] as [number, number],
 					parameters: {},
 				},
 			];
-			workflowsStore.workflow.nodes = mockNodes as INode[];
+			const store = useWorkflowDocumentStore(createWorkflowDocumentId('test-workflow'));
+			store.setNodes(mockNodes);
 
 			vi.mocked(removePreviewToken).mockReturnValue('test-node');
 
@@ -592,7 +606,7 @@ describe('useInstallNode', () => {
 					type: 'test-node',
 					name: 'Node 2',
 					typeVersion: 1,
-					position: [200, 200] as [number, number],
+					position: [256, 256] as [number, number],
 					parameters: {},
 				},
 			]);
@@ -605,7 +619,7 @@ describe('useInstallNode', () => {
 					type: 'test-node',
 					name: 'Node 1',
 					typeVersion: 1,
-					position: [100, 100] as [number, number],
+					position: [128, 128] as [number, number],
 					parameters: {},
 				},
 				{
@@ -613,7 +627,7 @@ describe('useInstallNode', () => {
 					type: 'test-node',
 					name: 'Node 2',
 					typeVersion: 1,
-					position: [200, 200] as [number, number],
+					position: [256, 256] as [number, number],
 					parameters: {},
 				},
 				{
@@ -621,11 +635,12 @@ describe('useInstallNode', () => {
 					type: 'other-node',
 					name: 'Node 3',
 					typeVersion: 1,
-					position: [300, 300] as [number, number],
+					position: [384, 384] as [number, number],
 					parameters: {},
 				},
 			];
-			workflowsStore.workflow.nodes = mockNodes as INode[];
+			const store = useWorkflowDocumentStore(createWorkflowDocumentId('test-workflow'));
+			store.setNodes(mockNodes);
 
 			vi.mocked(removePreviewToken).mockReturnValue('test-node');
 
@@ -643,7 +658,7 @@ describe('useInstallNode', () => {
 					type: 'test-node',
 					name: 'Node 1',
 					typeVersion: 1,
-					position: [100, 100] as [number, number],
+					position: [128, 128] as [number, number],
 					parameters: {},
 				},
 				{
@@ -651,7 +666,7 @@ describe('useInstallNode', () => {
 					type: 'test-node',
 					name: 'Node 2',
 					typeVersion: 1,
-					position: [200, 200] as [number, number],
+					position: [256, 256] as [number, number],
 					parameters: {},
 				},
 			]);

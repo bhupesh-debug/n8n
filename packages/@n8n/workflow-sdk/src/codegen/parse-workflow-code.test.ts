@@ -17,6 +17,33 @@ describe('parseWorkflowCodeToBuilder', () => {
 			expect(json.name).toBe('My Workflow');
 			expect(json.nodes).toHaveLength(1);
 		});
+
+		it('should parse SDK code using nodeJson()', () => {
+			const code = `
+				const telegramTrigger = trigger({
+					type: 'n8n-nodes-base.telegramTrigger',
+					version: 1,
+					config: { name: 'Telegram Trigger', parameters: {} }
+				});
+				const setChat = node({
+					type: 'n8n-nodes-base.set',
+					version: 3.4,
+					config: {
+						name: 'Set Chat',
+						parameters: { chatId: nodeJson(telegramTrigger, 'message.chat.id') }
+					}
+				});
+				export default workflow('test-id', 'My Workflow').add(telegramTrigger).to(setChat);
+			`;
+
+			const builder = parseWorkflowCodeToBuilder(code);
+			const json = builder.toJSON();
+			const setNode = json.nodes.find((node) => node.name === 'Set Chat');
+
+			expect(setNode?.parameters?.chatId).toBe(
+				"={{ $('Telegram Trigger').item.json.message.chat.id }}",
+			);
+		});
 	});
 
 	describe('plain object code (WorkflowJSON)', () => {
@@ -147,6 +174,26 @@ describe('parseWorkflowCodeToBuilder', () => {
 			expect(() => parseWorkflowCodeToBuilder('export default true')).toThrow(
 				'Code must export a workflow built with the workflow() SDK function.',
 			);
+		});
+	});
+
+	describe('resource limits', () => {
+		it('should surface a resource-limit violation as a SyntaxError', () => {
+			const doublings = 25;
+			const lines = ['const a0 = [1];'];
+
+			for (let i = 1; i <= doublings; i++) {
+				lines.push(`const a${i} = [...a${i - 1}, ...a${i - 1}];`);
+			}
+
+			lines.push(`export default a${doublings};`);
+			const code = lines.join('\n');
+
+			// Match the specific message, not just SyntaxError: exporting a bare
+			// array is also invalid on its own (wrong export type), so asserting
+			// only the error class would pass even if the resource limit were
+			// never enforced.
+			expect(() => parseWorkflowCodeToBuilder(code)).toThrow(/too much data/);
 		});
 	});
 });

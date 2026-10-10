@@ -1,7 +1,7 @@
 <script lang="ts" setup>
 import { useI18n } from '@n8n/i18n';
 import { ElDialog } from 'element-plus';
-import { N8nButton, N8nCard, N8nCheckbox, N8nIcon, N8nText } from '@n8n/design-system';
+import { N8nButton, N8nCallout, N8nCard, N8nCheckbox, N8nIcon, N8nText } from '@n8n/design-system';
 import { ref, watch, computed } from 'vue';
 import { useAccessSettingsCsvExport } from '@/features/settings/sso/provisioning/composables/useAccessSettingsCsvExport';
 import type { RoleAssignmentTransitionType } from '../composables/useUserRoleProvisioningForm';
@@ -9,11 +9,15 @@ import type { SupportedProtocolType } from '../../sso.store';
 
 const visible = defineModel<boolean>();
 
-const props = defineProps<{
-	transitionType: RoleAssignmentTransitionType;
-	showProjectRolesCsv: boolean;
-	authProtocol: SupportedProtocolType;
-}>();
+const props = withDefaults(
+	defineProps<{
+		transitionType: RoleAssignmentTransitionType;
+		showProjectRolesCsv: boolean;
+		authProtocol: SupportedProtocolType;
+		willDeleteProjectRules?: boolean;
+	}>(),
+	{ willDeleteProjectRules: false },
+);
 
 const emit = defineEmits<{
 	confirmProvisioning: [];
@@ -38,6 +42,14 @@ const isSwitchingToManual = computed(() => props.transitionType === 'switchToMan
 const messagingKey = computed(() => (isSwitchingToManual.value ? 'disable' : 'enable'));
 
 const shouldShowProjectRolesCsv = computed(() => props.showProjectRolesCsv);
+
+// The manual flow renders no CSV controls, so it must never wait for a download.
+const isCsvBackupPending = computed(
+	() =>
+		!isSwitchingToManual.value &&
+		(!hasDownloadedInstanceRoleCsv.value ||
+			(shouldShowProjectRolesCsv.value && !hasDownloadedProjectRoleCsv.value)),
+);
 
 watch(visible, () => {
 	loading.value = false;
@@ -142,15 +154,28 @@ const onConfirmProvisioningSetting = () => {
 				>
 			</div>
 		</template>
+		<div
+			v-if="props.willDeleteProjectRules"
+			class="mb-s"
+			data-test-id="provisioning-project-rules-deletion-warning"
+		>
+			<N8nCallout theme="danger">
+				<N8nText color="text-base" size="small" :bold="true">{{
+					locale.baseText('settings.provisioningConfirmDialog.projectRulesDeletion.warning')
+				}}</N8nText>
+				<br />
+				<N8nText color="text-base" size="small">{{
+					locale.baseText(
+						`settings.provisioningConfirmDialog.projectRulesDeletion.description.${messagingKey}`,
+					)
+				}}</N8nText>
+			</N8nCallout>
+		</div>
 		<div class="mb-s">
 			<N8nCard :class="$style.card">
 				<N8nCheckbox
 					v-model="confirmationChecked"
-					:disabled="
-						!isSwitchingToManual &&
-						(!hasDownloadedInstanceRoleCsv ||
-							(shouldShowProjectRolesCsv && !hasDownloadedProjectRoleCsv))
-					"
+					:disabled="isCsvBackupPending"
 					data-test-id="provisioning-confirmation-checkbox"
 				>
 					<template #label>
@@ -174,12 +199,7 @@ const onConfirmProvisioningSetting = () => {
 				<N8nButton
 					variant="solid"
 					type="button"
-					:disabled="
-						loading ||
-						!confirmationChecked ||
-						(!isSwitchingToManual && !hasDownloadedInstanceRoleCsv) ||
-						(shouldShowProjectRolesCsv && !hasDownloadedProjectRoleCsv)
-					"
+					:disabled="loading || !confirmationChecked || isCsvBackupPending"
 					data-test-id="provisioning-confirm-button"
 					@click="onConfirmProvisioningSetting"
 					>{{

@@ -1,3 +1,5 @@
+import type { AffectedResourceKind } from '@n8n/mcp-browser';
+
 import type { PermissionMode, ToolGroup } from './config';
 import { isProtectedSettingsPath, TOOL_GROUP_DEFINITIONS } from './config';
 import type { SettingsStore } from './settings-store';
@@ -14,10 +16,13 @@ export class GatewaySession {
 	private _dir: string;
 	private _permissions: Record<ToolGroup, PermissionMode>;
 	private readonly sessionAllows: Map<ToolGroup, Set<string>> = new Map();
+	private readonly _secretsBuffer: Map<string, Map<string, string>> = new Map();
 
 	constructor(
 		defaults: { permissions: Record<ToolGroup, PermissionMode>; dir: string },
 		private readonly settingsStore: SettingsStore,
+		/** Instance origin that persistent resource rules are scoped to. */
+		private readonly origin: string,
 	) {
 		this._permissions = { ...defaults.permissions };
 		this._dir = defaults.dir;
@@ -70,8 +75,12 @@ export class GatewaySession {
 	 *  2. Persistent allow list → 'allow'
 	 *  3. Session allow set     → 'allow'
 	 *  4. Group mode            → via getGroupMode() (includes cross-group constraints)
+	 *
+	 * Step 4 does not blanket-allow credential creation. Writing a credential needs
+	 * an approval aimed at that resource, so a group-wide mode alone leaves it at
+	 * 'ask'.
 	 */
-	check(toolGroup: ToolGroup, resource: string): PermissionMode {
+	check(toolGroup: ToolGroup, resource: string, kind?: AffectedResourceKind): PermissionMode {
 		// Self-protection: prevent tools from accessing the gateway settings directory
 		if (
 			(toolGroup === 'filesystemWrite' || toolGroup === 'filesystemRead') &&
@@ -80,11 +89,14 @@ export class GatewaySession {
 			return 'deny';
 		}
 
-		const rp = this.settingsStore.getResourcePermissions(toolGroup);
+		const rp = this.settingsStore.getResourcePermissions(this.origin, toolGroup);
 		if (rp.deny.includes(resource)) return 'deny';
 		if (rp.allow.includes(resource)) return 'allow';
 		if (this.hasSessionAllow(toolGroup, resource)) return 'allow';
-		return this.getGroupMode(toolGroup);
+
+		const groupMode = this.getGroupMode(toolGroup);
+		if (groupMode === 'allow' && kind === 'credential-write') return 'ask';
+		return groupMode;
 	}
 
 	// ---------------------------------------------------------------------------
@@ -100,8 +112,30 @@ export class GatewaySession {
 		set.add(resource);
 	}
 
-	clearSessionRules(): void {
+	clearSession(): void {
 		this.sessionAllows.clear();
+		this._secretsBuffer.clear();
+	}
+
+	// ---------------------------------------------------------------------------
+	// Secrets buffer
+	// ---------------------------------------------------------------------------
+
+	captureSecret(credentialsKey: string, field: string, value: string): void {
+		let fields = this._secretsBuffer.get(credentialsKey);
+		if (!fields) {
+			fields = new Map();
+			this._secretsBuffer.set(credentialsKey, fields);
+		}
+		fields.set(field, value);
+	}
+
+	getSecretFields(credentialsKey: string): Map<string, string> | undefined {
+		return this._secretsBuffer.get(credentialsKey);
+	}
+
+	clearSecrets(credentialsKey: string): void {
+		this._secretsBuffer.delete(credentialsKey);
 	}
 
 	// ---------------------------------------------------------------------------
@@ -109,11 +143,15 @@ export class GatewaySession {
 	// ---------------------------------------------------------------------------
 
 	alwaysAllow(toolGroup: ToolGroup, resource: string): void {
-		this.settingsStore.alwaysAllow(toolGroup, resource);
+		this.settingsStore.alwaysAllow(this.origin, toolGroup, resource);
 	}
 
 	alwaysDeny(toolGroup: ToolGroup, resource: string): void {
-		this.settingsStore.alwaysDeny(toolGroup, resource);
+		this.settingsStore.alwaysDeny(this.origin, toolGroup, resource);
+	}
+
+	claimUnscopedRules(): void {
+		this.settingsStore.claimUnscopedRules(this.origin);
 	}
 
 	// ---------------------------------------------------------------------------

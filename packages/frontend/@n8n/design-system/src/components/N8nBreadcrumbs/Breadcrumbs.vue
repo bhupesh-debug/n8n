@@ -1,8 +1,9 @@
-<script lang="ts" setup generic="UserType extends IUser">
+<script lang="ts" setup>
 import { computed, ref, watch } from 'vue';
 
-import type { IUser, UserAction } from '../../types';
+import { useI18n } from '../../composables/useI18n';
 import N8nActionToggle from '../N8nActionToggle';
+import type { DropdownMenuItemProps } from '../N8nDropdownMenu/DropdownMenu.types';
 import N8nLink from '../N8nLink';
 import N8nLoading from '../N8nLoading';
 import N8nText from '../N8nText';
@@ -50,6 +51,7 @@ const props = withDefaults(defineProps<Props>(), {
 	hiddenItemsTrigger: 'click',
 	dragActive: false,
 });
+const { t } = useI18n();
 
 const loadedHiddenItems = ref<PathItem[]>([]);
 const isLoadingHiddenItems = ref(false);
@@ -69,9 +71,9 @@ const dropdownDisabled = computed(() => {
 	return props.pathTruncated && !hasHiddenItems.value;
 });
 
-const hiddenItemActions = computed((): Array<UserAction<UserType>> => {
+const hiddenItemActions = computed((): Array<DropdownMenuItemProps<string>> => {
 	return loadedHiddenItems.value.map((item) => ({
-		value: item.id,
+		id: item.id,
 		label: item.label,
 		disabled: false,
 	}));
@@ -146,8 +148,8 @@ const emitItemHover = (id: string) => {
 	emit('itemHover', item);
 };
 
-const onHiddenItemMouseUp = (item: UserAction<UserType>) => {
-	const pathItem = [...props.items, ...loadedHiddenItems.value].find((i) => i.id === item.value);
+const onHiddenItemMouseUp = (item: DropdownMenuItemProps<string, unknown>) => {
+	const pathItem = [...props.items, ...loadedHiddenItems.value].find((i) => i.id === item.id);
 	if (!pathItem || !props.dragActive) {
 		return;
 	}
@@ -208,7 +210,15 @@ const handleTooltipClose = () => {
 						@action="emitItemSelected"
 						@item-mouseup="onHiddenItemMouseUp"
 					>
-						<N8nText :bold="true" :class="$style.dots">...</N8nText>
+						<N8nText
+							tag="button"
+							type="button"
+							:aria-label="t('breadcrumbs.showMoreItems')"
+							:bold="true"
+							:class="$style.dots"
+						>
+							...
+						</N8nText>
 					</N8nActionToggle>
 				</div>
 				<!-- Just a tooltip for smaller versions -->
@@ -245,7 +255,8 @@ const handleTooltipClose = () => {
 				<li
 					:class="{
 						[$style.item]: true,
-						[$style.current]: props.highlightLastItem && index === items.length - 1,
+						[$style.current]:
+							props.highlightLastItem && items.length > 1 && index === items.length - 1,
 						[$style.dragging]: props.dragActive,
 					}"
 					:title="item.label"
@@ -291,6 +302,7 @@ const handleTooltipClose = () => {
 
 .item {
 	border: var(--border-width) var(--border-style) transparent;
+	color: var(--color--text--tint-1);
 }
 
 .item.dragging:hover {
@@ -393,7 +405,12 @@ const handleTooltipClose = () => {
 }
 
 .dots {
+	appearance: none;
 	padding: 0 var(--spacing--4xs);
+	border: none;
+	background: none;
+	font: inherit;
+	cursor: pointer;
 	color: var(--color--text--tint-1);
 	border-radius: var(--radius);
 
@@ -441,7 +458,6 @@ const handleTooltipClose = () => {
 	.item * {
 		color: var(--color--text);
 		font-size: var(--font-size--sm);
-		line-height: var(--line-height--xs);
 	}
 
 	.item {

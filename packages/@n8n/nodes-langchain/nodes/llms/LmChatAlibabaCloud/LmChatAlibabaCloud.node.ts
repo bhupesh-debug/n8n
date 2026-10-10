@@ -1,10 +1,12 @@
 import { ChatOpenAI, type ClientOptions } from '@langchain/openai';
 import {
 	getProxyAgent,
+	aiClientFetch,
 	makeN8nLlmFailedAttemptHandler,
 	N8nLlmTracing,
 	getConnectionHintNoticeField,
 } from '@n8n/ai-utilities';
+import { shouldIncludeAlibabaModel } from '@n8n/ai-utilities/model-discovery';
 import {
 	NodeConnectionTypes,
 	NodeOperationError,
@@ -12,22 +14,130 @@ import {
 	type INodeTypeDescription,
 	type ISupplyDataFunctions,
 	type SupplyData,
+	type IExecuteSingleFunctions,
+	type INodeExecutionData,
+	type INodeProperties,
 } from 'n8n-workflow';
 
-import { BASE_URL_EXPRESSION, getBaseUrl } from './alibaba-cloud-base-url';
+import { MODEL_SELECTION_HINT } from '@utils/model-builder-hints';
+
+import { COMPATIBLE_MODE_SUFFIX } from './alibaba-cloud-base-url';
 import { openAiFailedAttemptHandler } from '../../vendors/OpenAi/helpers/error-handling';
+
+/** Drop non-chat models (embedding, rerank) from the model dropdown. */
+async function filterChatModels(
+	this: IExecuteSingleFunctions,
+	items: INodeExecutionData[],
+): Promise<INodeExecutionData[]> {
+	return items.filter(
+		(item) => typeof item.json.id === 'string' && shouldIncludeAlibabaModel(item.json.id),
+	);
+}
+
+const modelRLC: INodeProperties = {
+	displayName: 'Model',
+	name: 'model',
+	type: 'options',
+	description:
+		'The model which will generate the completion. <a href="https://www.qwencloud.com/models">Learn more</a>.',
+	typeOptions: {
+		loadOptions: {
+			routing: {
+				request: {
+					method: 'GET',
+					url: '/models',
+				},
+				output: {
+					postReceive: [
+						{
+							type: 'rootProperty',
+							properties: {
+								property: 'data',
+							},
+						},
+						{
+							type: 'setKeyValue',
+							properties: {
+								name: '={{$responseItem.id}}',
+								value: '={{$responseItem.id}}',
+							},
+						},
+						{
+							type: 'sort',
+							properties: {
+								key: 'name',
+							},
+						},
+					],
+				},
+			},
+		},
+	},
+	routing: {
+		send: {
+			type: 'body',
+			property: 'model',
+		},
+	},
+	default: 'qwen-plus',
+	builderHint: {
+		propertyHint:
+			'Prefer a stable Qwen model or rolling alias such as qwen-plus when the connected credential offers it. Do not select a preview model by default. ' +
+			MODEL_SELECTION_HINT,
+	},
+};
+
+// v1.1+: same routing as modelRLC, but the dropdown drops non-chat models
+// (embedding, rerank) through the shared `shouldIncludeAlibabaModel` predicate.
+const modelRLCV2: INodeProperties = {
+	...modelRLC,
+	typeOptions: {
+		loadOptions: {
+			routing: {
+				request: {
+					method: 'GET',
+					url: '/models',
+				},
+				output: {
+					postReceive: [
+						{
+							type: 'rootProperty',
+							properties: {
+								property: 'data',
+							},
+						},
+						filterChatModels,
+						{
+							type: 'setKeyValue',
+							properties: {
+								name: '={{$responseItem.id}}',
+								value: '={{$responseItem.id}}',
+							},
+						},
+						{
+							type: 'sort',
+							properties: {
+								key: 'name',
+							},
+						},
+					],
+				},
+			},
+		},
+	},
+};
 
 export class LmChatAlibabaCloud implements INodeType {
 	description: INodeTypeDescription = {
-		displayName: 'Alibaba Cloud Chat Model',
+		displayName: 'Qwen Cloud Chat Model',
 
 		name: 'lmChatAlibabaCloud',
 		icon: 'file:alibaba.svg',
 		group: ['transform'],
-		version: [1],
+		version: [1, 1.1],
 		description: 'For advanced usage with an AI chain',
 		defaults: {
-			name: 'Alibaba Cloud Chat Model',
+			name: 'Qwen Cloud Chat Model',
 		},
 		codex: {
 			categories: ['AI'],
@@ -57,7 +167,7 @@ export class LmChatAlibabaCloud implements INodeType {
 		],
 		requestDefaults: {
 			ignoreHttpStatusErrors: true,
-			baseURL: BASE_URL_EXPRESSION,
+			baseURL: `={{ $credentials?.url + "${COMPATIBLE_MODE_SUFFIX}" }}`,
 		},
 		properties: [
 			getConnectionHintNoticeField([NodeConnectionTypes.AiChain, NodeConnectionTypes.AiAgent]),
@@ -74,51 +184,20 @@ export class LmChatAlibabaCloud implements INodeType {
 				},
 			},
 			{
-				displayName: 'Model',
-				name: 'model',
-				type: 'options',
-				description:
-					'The model which will generate the completion. <a href="https://www.alibabacloud.com/help/en/model-studio/getting-started/models">Learn more</a>.',
-				typeOptions: {
-					loadOptions: {
-						routing: {
-							request: {
-								method: 'GET',
-								url: '/models',
-							},
-							output: {
-								postReceive: [
-									{
-										type: 'rootProperty',
-										properties: {
-											property: 'data',
-										},
-									},
-									{
-										type: 'setKeyValue',
-										properties: {
-											name: '={{$responseItem.id}}',
-											value: '={{$responseItem.id}}',
-										},
-									},
-									{
-										type: 'sort',
-										properties: {
-											key: 'name',
-										},
-									},
-								],
-							},
-						},
+				...modelRLC,
+				displayOptions: {
+					show: {
+						'@version': [{ _cnd: { eq: 1 } }],
 					},
 				},
-				routing: {
-					send: {
-						type: 'body',
-						property: 'model',
+			},
+			{
+				...modelRLCV2,
+				displayOptions: {
+					show: {
+						'@version': [{ _cnd: { gte: 1.1 } }],
 					},
 				},
-				default: 'qwen-plus',
 			},
 			{
 				displayName: 'Options',
@@ -213,6 +292,7 @@ export class LmChatAlibabaCloud implements INodeType {
 	async supplyData(this: ISupplyDataFunctions, itemIndex: number): Promise<SupplyData> {
 		const credentials = await this.getCredentials<{
 			apiKey: string;
+			url: string;
 			region: string;
 			workspaceId?: string;
 		}>('alibabaCloudApi');
@@ -237,15 +317,20 @@ export class LmChatAlibabaCloud implements INodeType {
 			);
 		}
 
-		const baseURL = getBaseUrl(credentials.region, credentials.workspaceId);
+		const baseURL = credentials.url + COMPATIBLE_MODE_SUFFIX;
 		const timeout = options.timeout;
 		const configuration: ClientOptions = {
 			baseURL,
+			fetch: aiClientFetch,
 			fetchOptions: {
-				dispatcher: getProxyAgent(baseURL, {
-					headersTimeout: timeout,
-					bodyTimeout: timeout,
-				}),
+				dispatcher: getProxyAgent(
+					baseURL,
+					{
+						headersTimeout: timeout,
+						bodyTimeout: timeout,
+					},
+					this.helpers.getSecureEgressFilter(),
+				),
 			},
 		};
 

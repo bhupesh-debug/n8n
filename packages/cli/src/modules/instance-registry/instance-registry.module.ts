@@ -1,10 +1,6 @@
-import type { ModuleInterface } from '@n8n/decorators';
+import type { ModuleInterface, SystemTaskClass } from '@n8n/decorators';
 import { BackendModule, OnShutdown } from '@n8n/decorators';
 import { Container } from '@n8n/di';
-
-function isFeatureFlagEnabled(): boolean {
-	return process.env.N8N_ENV_FEAT_INSTANCE_REGISTRY === 'true';
-}
 
 /**
  * Instance Registry Module
@@ -17,26 +13,45 @@ function isFeatureFlagEnabled(): boolean {
 @BackendModule({ name: 'instance-registry' })
 export class InstanceRegistryModule implements ModuleInterface {
 	async init() {
-		if (!isFeatureFlagEnabled()) {
-			return;
+		await import('./instance-registry.controller.js');
+
+		const { InstanceRegistryService } = await import('./instance-registry.service.js');
+		const instanceRegistryService = Container.get(InstanceRegistryService);
+		await instanceRegistryService.init();
+
+		const { InstanceRegistryProxyService } = await import(
+			'@/services/instance-registry-proxy.service.js'
+		);
+		Container.get(InstanceRegistryProxyService).registerProvider(instanceRegistryService);
+
+		await import('./checks/index.js');
+		const { CheckService } = await import('./checks/check.service.js');
+		Container.get(CheckService).init();
+	}
+
+	async systemTasks(): Promise<SystemTaskClass[]> {
+		const { InstanceRegistryReconciliationTask } = await import(
+			'./checks/instance-registry-reconciliation.task.js'
+		);
+
+		// The in-memory storage never holds a stale member and never expires an entry.
+		const { InstanceRegistryService } = await import('./instance-registry.service.js');
+		if (Container.get(InstanceRegistryService).storageBackend !== 'redis') {
+			return [InstanceRegistryReconciliationTask];
 		}
 
-		await import('./instance-registry.controller');
-
-		const { InstanceRegistryService } = await import('./instance-registry.service');
-		await Container.get(InstanceRegistryService).init();
-
-		const { StaleMemberCleanupService } = await import('./stale-member-cleanup.service');
-		Container.get(StaleMemberCleanupService).init();
+		const { InstanceRegistryHeartbeatTask } = await import('./instance-registry-heartbeat.task.js');
+		const { StaleMemberCleanupTask } = await import('./stale-member-cleanup.task.js');
+		return [
+			InstanceRegistryHeartbeatTask,
+			StaleMemberCleanupTask,
+			InstanceRegistryReconciliationTask,
+		];
 	}
 
 	@OnShutdown()
 	async shutdown() {
-		if (!isFeatureFlagEnabled()) {
-			return;
-		}
-
-		const { InstanceRegistryService } = await import('./instance-registry.service');
+		const { InstanceRegistryService } = await import('./instance-registry.service.js');
 		await Container.get(InstanceRegistryService).shutdown();
 	}
 }

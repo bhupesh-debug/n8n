@@ -1,15 +1,18 @@
-import type { IExecutionResponse, ExecutionRepository } from '@n8n/db';
+import type { EventService } from '@n8n/backend-services';
+import type { EndpointsConfig } from '@n8n/config';
+import type { IExecutionResponse } from '@n8n/db';
 import type express from 'express';
-import { mock } from 'jest-mock-extended';
 import type { InstanceSettings } from 'n8n-core';
 import { WAITING_TOKEN_QUERY_PARAM } from 'n8n-core';
-import type { IWorkflowBase, Workflow } from 'n8n-workflow';
+import type { INodeParameters, IWebhookData, IWorkflowBase, Workflow } from 'n8n-workflow';
 import { SEND_AND_WAIT_OPERATION } from 'n8n-workflow';
+import { mock } from 'vitest-mock-extended';
 
-import { ConflictError } from '@/errors/response-errors/conflict.error';
-import { NotFoundError } from '@/errors/response-errors/not-found.error';
-import * as WebhookHelpers from '@/webhooks/webhook-helpers';
+import { ConflictError, NotFoundError } from '@n8n/errors';
+import type { ExecutionPersistence } from '@/executions/execution-persistence';
+import { WaitingForms } from '@/webhooks/waiting-forms';
 import { WaitingWebhooks } from '@/webhooks/waiting-webhooks';
+import * as WebhookHelpers from '@/webhooks/webhook-helpers';
 import type { WebhookService } from '@/webhooks/webhook.service';
 import type { WaitingWebhookRequest } from '@/webhooks/webhook.types';
 import * as WorkflowExecuteAdditionalData from '@/workflow-execute-additional-data';
@@ -33,27 +36,34 @@ class TestWaitingWebhooks extends WaitingWebhooks {
 
 describe('WaitingWebhooks', () => {
 	const TEST_HMAC_SECRET = 'test-hmac-secret-key';
-	const executionRepository = mock<ExecutionRepository>();
+	const executionPersistence = mock<ExecutionPersistence>();
 	const mockWebhookService = mock<WebhookService>();
 	const mockInstanceSettings = mock<InstanceSettings>({ hmacSignatureSecret: TEST_HMAC_SECRET });
+	const mockEventService = mock<EventService>();
+	const mockEndpointsConfig = mock<EndpointsConfig>({
+		webhookWaiting: 'webhook-waiting',
+		formWaiting: 'form-waiting',
+	});
 	const waitingWebhooks = new TestWaitingWebhooks(
 		mock(),
 		mock(),
-		executionRepository,
+		executionPersistence,
 		mockWebhookService,
 		mockInstanceSettings,
+		mockEventService,
+		mockEndpointsConfig,
 	);
 
 	beforeEach(() => {
-		jest.restoreAllMocks();
-		jest.clearAllMocks();
+		vi.restoreAllMocks();
+		vi.clearAllMocks();
 	});
 
 	it('should throw NotFoundError if there is no execution to resume', async () => {
 		/**
 		 * Arrange
 		 */
-		executionRepository.findSingleExecution.mockResolvedValue(undefined);
+		executionPersistence.findSingleExecution.mockResolvedValue(undefined);
 
 		/**
 		 * Act
@@ -73,7 +83,7 @@ describe('WaitingWebhooks', () => {
 		/**
 		 * Arrange
 		 */
-		executionRepository.findSingleExecution.mockResolvedValue(
+		executionPersistence.findSingleExecution.mockResolvedValue(
 			mock<IExecutionResponse>({ status: 'running' }),
 		);
 
@@ -95,8 +105,14 @@ describe('WaitingWebhooks', () => {
 		/**
 		 * Arrange
 		 */
-		executionRepository.findSingleExecution.mockResolvedValue(
-			mock<IExecutionResponse>({ finished: true, workflowData: { nodes: [] } }),
+		executionPersistence.findSingleExecution.mockResolvedValue(
+			mock<IExecutionResponse>({
+				finished: true,
+				// Provide real values for the fields the Workflow constructor reads so
+				// vitest-mock-extended keeps them as plain data rather than auto-mocking
+				// them into functions (whose read-only `.mock` breaks ObservableObject).
+				workflowData: { nodes: [], connections: {}, staticData: {} },
+			}),
 		);
 
 		/**
@@ -273,11 +289,11 @@ describe('WaitingWebhooks', () => {
 					staticData: {},
 				},
 			});
-			executionRepository.findSingleExecution.mockResolvedValue(execution);
+			executionPersistence.findSingleExecution.mockResolvedValue(execution);
 
-			const mockStatus = jest.fn().mockReturnThis();
-			const mockRender = jest.fn();
-			const mockJson = jest.fn();
+			const mockStatus = vi.fn().mockReturnThis();
+			const mockRender = vi.fn();
+			const mockJson = vi.fn();
 			const res = mock<express.Response>({
 				status: mockStatus,
 				render: mockRender,
@@ -297,6 +313,10 @@ describe('WaitingWebhooks', () => {
 			/* Assert */
 			expect(mockStatus).toHaveBeenCalledWith(401);
 			expect(mockRender).toHaveBeenCalledWith('form-invalid-token');
+			expect(res.setHeader).toHaveBeenCalledWith(
+				'Content-Security-Policy',
+				expect.stringContaining('sandbox'),
+			);
 			expect(mockJson).not.toHaveBeenCalled();
 			expect(result).toEqual({ noWebhookResponse: true });
 		});
@@ -333,11 +353,11 @@ describe('WaitingWebhooks', () => {
 					staticData: {},
 				},
 			});
-			executionRepository.findSingleExecution.mockResolvedValue(execution);
+			executionPersistence.findSingleExecution.mockResolvedValue(execution);
 
-			const mockStatus = jest.fn().mockReturnThis();
-			const mockRender = jest.fn();
-			const mockJson = jest.fn();
+			const mockStatus = vi.fn().mockReturnThis();
+			const mockRender = vi.fn();
+			const mockJson = vi.fn();
 			const res = mock<express.Response>({
 				status: mockStatus,
 				render: mockRender,
@@ -362,6 +382,411 @@ describe('WaitingWebhooks', () => {
 		});
 	});
 
+	/*
+	 * Regression test — a send-and-wait node id is recognised whether it arrives as a
+	 * route suffix or inside the signature query value, and either way the request
+	 * must pass HMAC validation.
+	 * Ref: CAT-3881
+	 * 2026-09-18
+	 */
+	describe('send-and-wait node id in the signature query value', () => {
+		const nodeId = 'send-and-wait-node-id';
+		const resumeToken = 'a'.repeat(64);
+
+		const buildExecution = () =>
+			mock<IExecutionResponse>({
+				finished: false,
+				status: 'waiting',
+				data: {
+					executionData: {
+						nodeExecutionStack: [
+							{
+								node: {
+									id: nodeId,
+									name: 'SendAndWaitNode',
+									type: 'n8n-nodes-base.sendAndWait',
+									parameters: { operation: SEND_AND_WAIT_OPERATION },
+									typeVersion: 1,
+									position: [0, 0],
+									disabled: false,
+								},
+								data: {},
+								source: null,
+							},
+						],
+					},
+					resultData: {
+						lastNodeExecuted: 'SendAndWaitNode',
+						runData: {
+							SendAndWaitNode: [{ startTime: 0, executionTime: 0, executionIndex: 0, source: [] }],
+						},
+						error: undefined,
+					},
+					resumeToken,
+				},
+				workflowData: {
+					id: 'workflow1',
+					name: 'Test Workflow',
+					nodes: [
+						{
+							id: nodeId,
+							name: 'SendAndWaitNode',
+							type: 'n8n-nodes-base.sendAndWait',
+							parameters: { operation: SEND_AND_WAIT_OPERATION },
+							typeVersion: 1,
+							position: [0, 0],
+						},
+					],
+					connections: {},
+					active: false,
+					settings: {},
+					staticData: {},
+				},
+			});
+
+		const buildRes = () =>
+			mock<express.Response>({
+				status: vi.fn().mockReturnThis(),
+				render: vi.fn(),
+				json: vi.fn(),
+			});
+
+		it('rejects with 401 when the node id rides the signature query instead of the route suffix and the HMAC is invalid', async () => {
+			executionPersistence.findSingleExecution.mockResolvedValue(buildExecution());
+
+			const executeWebhookSpy = vi.spyOn(WebhookHelpers, 'executeWebhook');
+
+			const res = buildRes();
+			// No route suffix; the node id is carried in the signature query value (old URL format).
+			const req = mock<WaitingWebhookRequest>({
+				params: { path: 'execution-id', suffix: undefined },
+				method: 'GET',
+				url: `/webhook-waiting/execution-id?approved=true&${WAITING_TOKEN_QUERY_PARAM}=${resumeToken}%2F${nodeId}`,
+				headers: { host: 'example.com' },
+			});
+
+			const result = await waitingWebhooks.executeWebhook(req, res);
+
+			expect(res.status).toHaveBeenCalledWith(401);
+			expect(executeWebhookSpy).not.toHaveBeenCalled();
+			expect(result).toEqual({ noWebhookResponse: true });
+		});
+
+		it('resumes when the node id is the route suffix and the HMAC is valid', async () => {
+			const execution = buildExecution();
+			executionPersistence.findSingleExecution.mockResolvedValue(execution);
+
+			mockWebhookService.getNodeWebhooks.mockReturnValue([
+				{
+					httpMethod: 'GET',
+					path: nodeId,
+					webhookDescription: {
+						restartWebhook: true,
+						httpMethod: 'GET',
+						name: 'default',
+						path: nodeId,
+						nodeType: undefined,
+					} as any,
+				},
+			] as any);
+			vi.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
+			const executeWebhookSpy = vi
+				.spyOn(WebhookHelpers, 'executeWebhook')
+				.mockImplementation(
+					async (_w, _wd, _wfd, _wsn, _m, _pr, _red, _eid, _req, _res, callback) => {
+						callback(null, { noWebhookResponse: true });
+						return undefined;
+					},
+				);
+
+			const res = buildRes();
+			const signedPath = `/webhook-waiting/execution-id/${nodeId}?approved=true`;
+			const signature = require('crypto')
+				.createHmac('sha256', TEST_HMAC_SECRET)
+				.update(signedPath)
+				.digest('hex');
+			const req = mock<WaitingWebhookRequest>({
+				params: { path: 'execution-id', suffix: nodeId },
+				method: 'GET',
+				url: `${signedPath}&${WAITING_TOKEN_QUERY_PARAM}=${signature}`,
+				headers: { host: 'example.com' },
+			});
+
+			const result = await waitingWebhooks.executeWebhook(req, res);
+
+			expect(res.status).not.toHaveBeenCalledWith(401);
+			expect(executeWebhookSpy).toHaveBeenCalled();
+			expect(result).toEqual({ noWebhookResponse: true });
+		});
+	});
+
+	describe('token stripping on resume', () => {
+		const resumeToken = 'a'.repeat(64);
+
+		const buildExecution = () =>
+			mock<IExecutionResponse>({
+				finished: false,
+				status: 'waiting',
+				data: {
+					executionData: {
+						nodeExecutionStack: [
+							{
+								node: {
+									id: 'wait-node-id',
+									name: 'WaitNode',
+									type: 'n8n-nodes-base.wait',
+									parameters: { resume: 'webhook' },
+									typeVersion: 1,
+									position: [0, 0],
+									disabled: false,
+								},
+								data: {},
+								source: null,
+							},
+						],
+					},
+					resultData: {
+						lastNodeExecuted: 'WaitNode',
+						runData: {
+							WaitNode: [{ startTime: 0, executionTime: 0, executionIndex: 0, source: [] }],
+						},
+						error: undefined,
+					},
+					resumeToken,
+				},
+				workflowData: {
+					id: 'workflow1',
+					name: 'Test Workflow',
+					nodes: [
+						{
+							id: 'wait-node-id',
+							name: 'WaitNode',
+							type: 'n8n-nodes-base.wait',
+							parameters: { resume: 'webhook' },
+							typeVersion: 1,
+							position: [0, 0],
+						},
+					],
+					connections: {},
+					active: false,
+					settings: {},
+					staticData: {},
+				},
+			});
+
+		it('removes the token from the request query and url before the node runs', async () => {
+			/* Arrange */
+			executionPersistence.findSingleExecution.mockResolvedValue(buildExecution());
+			mockWebhookService.getNodeWebhooks.mockReturnValue([
+				{
+					httpMethod: 'GET',
+					path: '',
+					webhookDescription: {
+						restartWebhook: true,
+						httpMethod: 'GET',
+						name: 'default',
+						path: '',
+						nodeType: undefined,
+					} as any,
+				},
+			] as any);
+			vi.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
+			const executeWebhookSpy = vi
+				.spyOn(WebhookHelpers, 'executeWebhook')
+				.mockImplementation(
+					async (_w, _wd, _wfd, _wsn, _m, _pr, _red, _eid, _req, _res, callback) => {
+						callback(null, { noWebhookResponse: true });
+						return undefined;
+					},
+				);
+
+			const req = mock<WaitingWebhookRequest>({
+				params: { path: 'execution-id', suffix: undefined },
+				method: 'GET',
+				url: `/webhook-waiting/execution-id?${WAITING_TOKEN_QUERY_PARAM}=${resumeToken}&foo=bar`,
+				headers: { host: 'example.com' },
+			});
+			req.query = { [WAITING_TOKEN_QUERY_PARAM]: resumeToken, foo: 'bar' };
+
+			/* Act */
+			await waitingWebhooks.executeWebhook(req, mock<express.Response>());
+
+			/* Assert */
+			expect(executeWebhookSpy).toHaveBeenCalled();
+			const [, , , , , , , , calledReq] = executeWebhookSpy.mock.calls[0];
+			expect((calledReq as express.Request).query).not.toHaveProperty(WAITING_TOKEN_QUERY_PARAM);
+			expect((calledReq as express.Request).query).toEqual({ foo: 'bar' });
+			expect((calledReq as express.Request).url).not.toContain(resumeToken);
+			expect((calledReq as express.Request).url).toBe('/webhook-waiting/execution-id?foo=bar');
+		});
+	});
+
+	describe('form-resume redirect to form-waiting', () => {
+		const buildExecution = (opts: { nodeType: string; nodeParameters?: INodeParameters }) =>
+			mock<IExecutionResponse>({
+				status: 'waiting',
+				finished: false,
+				data: {
+					resumeToken: undefined,
+					executionData: {
+						nodeExecutionStack: [
+							{
+								node: {
+									id: 'resume-node-id',
+									name: 'ResumeNode',
+									type: opts.nodeType,
+									parameters: opts.nodeParameters ?? {},
+									typeVersion: 1,
+									position: [0, 0],
+									disabled: false,
+								},
+								data: {},
+								source: null,
+							},
+						],
+					},
+					resultData: {
+						lastNodeExecuted: 'ResumeNode',
+						runData: {
+							ResumeNode: [{ startTime: 0, executionTime: 0, executionIndex: 0, source: [] }],
+						},
+						error: undefined,
+					},
+				},
+				workflowData: {
+					id: 'workflow1',
+					name: 'Test Workflow',
+					nodes: [
+						{
+							id: 'resume-node-id',
+							name: 'ResumeNode',
+							type: opts.nodeType,
+							parameters: opts.nodeParameters ?? {},
+							typeVersion: 1,
+							position: [0, 0],
+						},
+					],
+					connections: {},
+					active: true,
+					settings: {},
+					staticData: {},
+				},
+			});
+
+		const buildRes = () =>
+			mock<express.Response>({
+				redirect: vi.fn(),
+				status: vi.fn().mockReturnThis(),
+				json: vi.fn(),
+				render: vi.fn(),
+			});
+
+		it('redirects a Wait node resuming on form submission', async () => {
+			executionPersistence.findSingleExecution.mockResolvedValue(
+				buildExecution({ nodeType: 'n8n-nodes-base.wait', nodeParameters: { resume: 'form' } }),
+			);
+			const res = buildRes();
+			const req = mock<WaitingWebhookRequest>({
+				params: { path: 'exec-id', suffix: undefined },
+				method: 'GET',
+				originalUrl: '/webhook-waiting/exec-id?signature=abc',
+			});
+
+			const result = await waitingWebhooks.executeWebhook(req, res);
+
+			expect(res.redirect).toHaveBeenCalledWith(307, '/form-waiting/exec-id?signature=abc');
+			expect(result).toEqual({ noWebhookResponse: true });
+		});
+
+		it('redirects a Form node', async () => {
+			executionPersistence.findSingleExecution.mockResolvedValue(
+				buildExecution({ nodeType: 'n8n-nodes-base.form' }),
+			);
+			const res = buildRes();
+			const req = mock<WaitingWebhookRequest>({
+				params: { path: 'exec-id', suffix: 'my-suffix' },
+				method: 'POST',
+				originalUrl: '/webhook-waiting/exec-id/my-suffix?signature=abc',
+			});
+
+			const result = await waitingWebhooks.executeWebhook(req, res);
+
+			expect(res.redirect).toHaveBeenCalledWith(
+				307,
+				'/form-waiting/exec-id/my-suffix?signature=abc',
+			);
+			expect(result).toEqual({ noWebhookResponse: true });
+		});
+
+		it('does not redirect a Wait node resuming on webhook call', async () => {
+			executionPersistence.findSingleExecution.mockResolvedValue(
+				buildExecution({ nodeType: 'n8n-nodes-base.wait', nodeParameters: { resume: 'webhook' } }),
+			);
+			mockWebhookService.getNodeWebhooks.mockReturnValue([
+				{
+					httpMethod: 'GET',
+					path: '',
+					webhookDescription: {
+						restartWebhook: true,
+						httpMethod: 'GET',
+						name: 'default',
+						path: '',
+						nodeType: undefined,
+					} as any,
+				},
+			] as any);
+			vi.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
+			vi.spyOn(WebhookHelpers, 'executeWebhook').mockImplementation(
+				async (_w, _wd, _wfd, _wsn, _m, _pr, _red, _eid, _req, _res, callback) => {
+					callback(null, { noWebhookResponse: true });
+					return undefined;
+				},
+			);
+			const res = buildRes();
+			const req = mock<WaitingWebhookRequest>({
+				params: { path: 'exec-id', suffix: undefined },
+				method: 'GET',
+				originalUrl: '/webhook-waiting/exec-id?signature=abc',
+			});
+
+			await waitingWebhooks.executeWebhook(req, res);
+
+			expect(res.redirect).not.toHaveBeenCalled();
+		});
+
+		it('does not redirect when the waiting endpoints are configured identically', async () => {
+			const identicalEndpointsConfig = mock<EndpointsConfig>({
+				webhookWaiting: 'webhook-waiting',
+				formWaiting: 'webhook-waiting',
+			});
+			const webhooksWithIdenticalEndpoints = new TestWaitingWebhooks(
+				mock(),
+				mock(),
+				executionPersistence,
+				mockWebhookService,
+				mockInstanceSettings,
+				mockEventService,
+				identicalEndpointsConfig,
+			);
+			executionPersistence.findSingleExecution.mockResolvedValue(
+				buildExecution({ nodeType: 'n8n-nodes-base.wait', nodeParameters: { resume: 'form' } }),
+			);
+			mockWebhookService.getNodeWebhooks.mockReturnValue([]);
+			vi.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
+			const res = buildRes();
+			const req = mock<WaitingWebhookRequest>({
+				params: { path: 'exec-id', suffix: undefined },
+				method: 'GET',
+				originalUrl: '/webhook-waiting/exec-id?signature=abc',
+			});
+
+			await expect(webhooksWithIdenticalEndpoints.executeWebhook(req, res)).rejects.toThrowError(
+				NotFoundError,
+			);
+			expect(res.redirect).not.toHaveBeenCalled();
+		});
+	});
+
 	describe('createWorkflow', () => {
 		it('should handle old executions with missing activeVersionId field when active=true', () => {
 			const workflowData = {
@@ -370,7 +795,7 @@ describe('WaitingWebhooks', () => {
 				nodes: [],
 				connections: {},
 				active: true,
-				activeVersionId: undefined, // Must be explicitly set to undefined; jest-mock-extended returns a truthy mock if omitted
+				activeVersionId: undefined, // Must be explicitly set to undefined; vitest-mock-extended returns a truthy mock if omitted
 				settings: {},
 				staticData: {},
 				isArchived: false,
@@ -391,7 +816,7 @@ describe('WaitingWebhooks', () => {
 				nodes: [],
 				connections: {},
 				active: false,
-				activeVersionId: undefined, // Must be explicitly set to undefined; jest-mock-extended returns a truthy mock if omitted
+				activeVersionId: undefined, // Must be explicitly set to undefined; vitest-mock-extended returns a truthy mock if omitted
 				settings: {},
 				staticData: {},
 				isArchived: false,
@@ -518,7 +943,7 @@ describe('WaitingWebhooks', () => {
 			mockExecution.data.resultData.error = undefined;
 			mockExecution.data.resumeToken = undefined;
 
-			executionRepository.findSingleExecution.mockResolvedValue(mockExecution);
+			executionPersistence.findSingleExecution.mockResolvedValue(mockExecution);
 
 			const mockReq = mock<WaitingWebhookRequest>({
 				params: { path: executionId, suffix: undefined },
@@ -526,26 +951,24 @@ describe('WaitingWebhooks', () => {
 			});
 			const mockRes = mock<express.Response>();
 
-			jest
-				.spyOn(WebhookHelpers, 'executeWebhook')
-				.mockImplementation(
-					async (
-						_workflow,
-						_webhookData,
-						_workflowData,
-						_workflowStartNode,
-						_mode,
-						_pushRef,
-						_runExecutionData,
-						_executionId,
-						_req,
-						_res,
-						callback,
-					) => {
-						callback(null, { noWebhookResponse: true });
-						return undefined;
-					},
-				);
+			vi.spyOn(WebhookHelpers, 'executeWebhook').mockImplementation(
+				async (
+					_workflow,
+					_webhookData,
+					_workflowData,
+					_workflowStartNode,
+					_mode,
+					_pushRef,
+					_runExecutionData,
+					_executionId,
+					_req,
+					_res,
+					callback,
+				) => {
+					callback(null, { noWebhookResponse: true });
+					return undefined;
+				},
+			);
 
 			mockWebhookService.getNodeWebhooks.mockReturnValue([
 				{
@@ -561,7 +984,7 @@ describe('WaitingWebhooks', () => {
 				},
 			] as any);
 
-			jest.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
+			vi.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
 
 			/**
 			 * Act
@@ -573,6 +996,93 @@ describe('WaitingWebhooks', () => {
 			 */
 			const nodeExecutionStack = mockExecution.data.executionData!.nodeExecutionStack;
 			expect(nodeExecutionStack[0].node.rewireOutputLogTo).toBe('ai_tool');
+		});
+
+		it('rejects (does not hang) when executeWebhook throws before invoking the callback', async () => {
+			const executionId = 'test-execution-id';
+			const lastNodeExecuted = 'WaitNode';
+
+			const mockExecution = mock<IExecutionResponse>({
+				id: executionId,
+				status: 'waiting',
+				finished: false,
+				mode: 'manual',
+				data: {
+					executionData: {
+						nodeExecutionStack: [
+							{
+								node: {
+									name: lastNodeExecuted,
+									type: 'n8n-nodes-base.wait',
+									typeVersion: 1,
+									parameters: {},
+									id: 'node-id',
+									position: [0, 0],
+									disabled: false,
+								},
+								data: {},
+								source: null,
+							},
+						],
+					},
+					resultData: {
+						runData: {
+							[lastNodeExecuted]: [
+								{ startTime: 123, executionTime: 456, executionIndex: 0, source: [] },
+							],
+						},
+						lastNodeExecuted,
+					},
+				},
+				workflowData: {
+					id: 'workflow-id',
+					name: 'Test Workflow',
+					nodes: [
+						{
+							name: lastNodeExecuted,
+							type: 'n8n-nodes-base.wait',
+							typeVersion: 1,
+							parameters: {},
+							id: 'node-id',
+							position: [0, 0],
+						},
+					],
+					connections: {},
+					active: true,
+					settings: {},
+					staticData: {},
+				},
+			});
+			mockExecution.data.resultData.error = undefined;
+			mockExecution.data.resumeToken = undefined;
+			executionPersistence.findSingleExecution.mockResolvedValue(mockExecution);
+
+			const preCallbackError = new Error('response option expression failed');
+			vi.spyOn(WebhookHelpers, 'executeWebhook').mockRejectedValue(preCallbackError);
+
+			mockWebhookService.getNodeWebhooks.mockReturnValue([
+				{
+					httpMethod: 'POST',
+					path: '',
+					webhookDescription: {
+						restartWebhook: true,
+						httpMethod: 'POST',
+						name: 'default',
+						path: '',
+						nodeType: undefined,
+					} as any,
+				},
+			] as any);
+			vi.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
+
+			const mockReq = mock<WaitingWebhookRequest>({
+				params: { path: executionId, suffix: undefined },
+				method: 'POST',
+			});
+
+			await expect(waitingWebhooks.executeWebhook(mockReq, mock<express.Response>())).rejects.toBe(
+				preCallbackError,
+			);
 		});
 
 		it('should preserve inputOverride for nodes that have it', async () => {
@@ -648,7 +1158,7 @@ describe('WaitingWebhooks', () => {
 			mockExecution.data.resultData.error = undefined;
 			mockExecution.data.resumeToken = undefined;
 
-			executionRepository.findSingleExecution.mockResolvedValue(mockExecution);
+			executionPersistence.findSingleExecution.mockResolvedValue(mockExecution);
 
 			const mockReq = mock<WaitingWebhookRequest>({
 				params: { path: executionId, suffix: undefined },
@@ -656,26 +1166,24 @@ describe('WaitingWebhooks', () => {
 			});
 			const mockRes = mock<express.Response>();
 
-			jest
-				.spyOn(WebhookHelpers, 'executeWebhook')
-				.mockImplementation(
-					async (
-						_workflow,
-						_webhookData,
-						_workflowData,
-						_workflowStartNode,
-						_mode,
-						_pushRef,
-						_runExecutionData,
-						_executionId,
-						_req,
-						_res,
-						callback,
-					) => {
-						callback(null, { noWebhookResponse: true });
-						return undefined;
-					},
-				);
+			vi.spyOn(WebhookHelpers, 'executeWebhook').mockImplementation(
+				async (
+					_workflow,
+					_webhookData,
+					_workflowData,
+					_workflowStartNode,
+					_mode,
+					_pushRef,
+					_runExecutionData,
+					_executionId,
+					_req,
+					_res,
+					callback,
+				) => {
+					callback(null, { noWebhookResponse: true });
+					return undefined;
+				},
+			);
 
 			// Mock the webhookService to return a valid webhook
 			mockWebhookService.getNodeWebhooks.mockReturnValue([
@@ -692,7 +1200,7 @@ describe('WaitingWebhooks', () => {
 				},
 			] as any);
 
-			jest.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
+			vi.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
 
 			/**
 			 * Act
@@ -785,7 +1293,7 @@ describe('WaitingWebhooks', () => {
 			mockExecution.data.resultData.error = undefined;
 			mockExecution.data.resumeToken = undefined;
 
-			executionRepository.findSingleExecution.mockResolvedValue(mockExecution);
+			executionPersistence.findSingleExecution.mockResolvedValue(mockExecution);
 
 			const mockReq = mock<WaitingWebhookRequest>({
 				params: { path: executionId, suffix: undefined },
@@ -793,26 +1301,24 @@ describe('WaitingWebhooks', () => {
 			});
 			const mockRes = mock<express.Response>();
 
-			jest
-				.spyOn(WebhookHelpers, 'executeWebhook')
-				.mockImplementation(
-					async (
-						_workflow,
-						_webhookData,
-						_workflowData,
-						_workflowStartNode,
-						_mode,
-						_pushRef,
-						_runExecutionData,
-						_executionId,
-						_req,
-						_res,
-						callback,
-					) => {
-						callback(null, { noWebhookResponse: true });
-						return undefined;
-					},
-				);
+			vi.spyOn(WebhookHelpers, 'executeWebhook').mockImplementation(
+				async (
+					_workflow,
+					_webhookData,
+					_workflowData,
+					_workflowStartNode,
+					_mode,
+					_pushRef,
+					_runExecutionData,
+					_executionId,
+					_req,
+					_res,
+					callback,
+				) => {
+					callback(null, { noWebhookResponse: true });
+					return undefined;
+				},
+			);
 
 			mockWebhookService.getNodeWebhooks.mockReturnValue([
 				{
@@ -828,7 +1334,7 @@ describe('WaitingWebhooks', () => {
 				},
 			] as any);
 
-			jest.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
+			vi.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
 
 			/**
 			 * Act
@@ -922,7 +1428,7 @@ describe('WaitingWebhooks', () => {
 			mockExecution.data.resultData.error = undefined;
 			mockExecution.data.resumeToken = undefined;
 
-			executionRepository.findSingleExecution.mockResolvedValue(mockExecution);
+			executionPersistence.findSingleExecution.mockResolvedValue(mockExecution);
 
 			const mockReq = mock<WaitingWebhookRequest>({
 				params: { path: executionId, suffix: undefined },
@@ -930,26 +1436,24 @@ describe('WaitingWebhooks', () => {
 			});
 			const mockRes = mock<express.Response>();
 
-			jest
-				.spyOn(WebhookHelpers, 'executeWebhook')
-				.mockImplementation(
-					async (
-						_workflow,
-						_webhookData,
-						_workflowData,
-						_workflowStartNode,
-						_mode,
-						_pushRef,
-						_runExecutionData,
-						_executionId,
-						_req,
-						_res,
-						callback,
-					) => {
-						callback(null, { noWebhookResponse: true });
-						return undefined;
-					},
-				);
+			vi.spyOn(WebhookHelpers, 'executeWebhook').mockImplementation(
+				async (
+					_workflow,
+					_webhookData,
+					_workflowData,
+					_workflowStartNode,
+					_mode,
+					_pushRef,
+					_runExecutionData,
+					_executionId,
+					_req,
+					_res,
+					callback,
+				) => {
+					callback(null, { noWebhookResponse: true });
+					return undefined;
+				},
+			);
 
 			mockWebhookService.getNodeWebhooks.mockReturnValue([
 				{
@@ -966,7 +1470,7 @@ describe('WaitingWebhooks', () => {
 			] as any);
 
 			// Mock WorkflowExecuteAdditionalData
-			jest.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
+			vi.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
 
 			/**
 			 * Act
@@ -1054,7 +1558,7 @@ describe('WaitingWebhooks', () => {
 			mockExecution.data.resultData.error = undefined;
 			mockExecution.data.resumeToken = undefined;
 
-			executionRepository.findSingleExecution.mockResolvedValue(mockExecution);
+			executionPersistence.findSingleExecution.mockResolvedValue(mockExecution);
 
 			const mockReq = mock<WaitingWebhookRequest>({
 				params: { path: executionId, suffix: undefined },
@@ -1063,26 +1567,24 @@ describe('WaitingWebhooks', () => {
 			const mockRes = mock<express.Response>();
 
 			// Mock the WebhookHelpers.executeWebhook
-			jest
-				.spyOn(WebhookHelpers, 'executeWebhook')
-				.mockImplementation(
-					async (
-						_workflow,
-						_webhookData,
-						_workflowData,
-						_workflowStartNode,
-						_mode,
-						_pushRef,
-						_runExecutionData,
-						_executionId,
-						_req,
-						_res,
-						callback,
-					) => {
-						callback(null, { noWebhookResponse: true });
-						return undefined;
-					},
-				);
+			vi.spyOn(WebhookHelpers, 'executeWebhook').mockImplementation(
+				async (
+					_workflow,
+					_webhookData,
+					_workflowData,
+					_workflowStartNode,
+					_mode,
+					_pushRef,
+					_runExecutionData,
+					_executionId,
+					_req,
+					_res,
+					callback,
+				) => {
+					callback(null, { noWebhookResponse: true });
+					return undefined;
+				},
+			);
 
 			// Mock the webhookService to return a valid webhook
 			mockWebhookService.getNodeWebhooks.mockReturnValue([
@@ -1099,7 +1601,7 @@ describe('WaitingWebhooks', () => {
 				},
 			] as any);
 
-			jest.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
+			vi.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
 
 			/**
 			 * Act
@@ -1111,6 +1613,338 @@ describe('WaitingWebhooks', () => {
 			 */
 			const nodeExecutionStack = mockExecution.data.executionData!.nodeExecutionStack;
 			expect(nodeExecutionStack[0].node.rewireOutputLogTo).toBeUndefined();
+		});
+	});
+
+	describe('execution-resumed event', () => {
+		function createMockExecution(overrides: {
+			nodeType: string;
+			nodeName: string;
+			nodeId: string;
+			typeVersion?: number;
+			nodeParameters?: Record<string, string>;
+		}) {
+			const { nodeType, nodeName, nodeId, typeVersion = 1, nodeParameters = {} } = overrides;
+			return mock<IExecutionResponse>({
+				id: 'test-execution-id',
+				status: 'waiting',
+				finished: false,
+				mode: 'manual',
+				data: {
+					resumeToken: undefined,
+					executionData: {
+						nodeExecutionStack: [
+							{
+								node: {
+									name: nodeName,
+									type: nodeType,
+									typeVersion,
+									parameters: nodeParameters,
+									id: nodeId,
+									position: [0, 0],
+									disabled: false,
+								},
+								data: {},
+								source: null,
+							},
+						],
+					},
+					resultData: {
+						error: undefined,
+						runData: {
+							[nodeName]: [{ startTime: 0, executionTime: 0, executionIndex: 0, source: [] }],
+						},
+						lastNodeExecuted: nodeName,
+					},
+				},
+				workflowData: {
+					id: 'workflow-id',
+					name: 'Test Workflow',
+					nodes: [
+						{
+							name: nodeName,
+							type: nodeType,
+							typeVersion,
+							parameters: nodeParameters,
+							id: nodeId,
+							position: [0, 0],
+						},
+					],
+					connections: {},
+					active: false,
+					activeVersionId: null,
+					settings: {},
+					staticData: {},
+					isArchived: false,
+					createdAt: new Date(),
+					updatedAt: new Date(),
+				},
+			});
+		}
+
+		function createMockRes(): express.Response {
+			return mock<express.Response>({
+				status: vi.fn().mockReturnThis(),
+				json: vi.fn(),
+				render: vi.fn(),
+			});
+		}
+
+		beforeEach(() => {
+			vi.spyOn(WorkflowExecuteAdditionalData, 'getBase').mockResolvedValue({} as any);
+			executionPersistence.findSingleExecution.mockResolvedValue(
+				createMockExecution({
+					nodeType: 'n8n-nodes-base.wait',
+					nodeName: 'WaitNode',
+					nodeId: 'node-id',
+				}),
+			);
+		});
+
+		it('should emit once with the time captured before webhook invocation', async () => {
+			const responseAt = new Date('2026-10-09T12:00:00.000Z');
+			mockWebhookService.getNodeWebhooks.mockReturnValue([
+				{
+					httpMethod: 'POST',
+					path: '',
+					webhookDescription: {
+						restartWebhook: true,
+						httpMethod: 'POST',
+						name: 'default',
+						path: '',
+						nodeType: undefined,
+					} as any,
+				},
+			] as any);
+			vi.spyOn(WebhookHelpers, 'executeWebhook').mockImplementation(
+				async (_w, _wd, _wfd, _wsn, _m, _pr, _red, _eid, _req, _res, callback, _dn, options) => {
+					vi.setSystemTime(new Date(responseAt.getTime() + 5000));
+					options?.onResume?.();
+					callback(null, { noWebhookResponse: true });
+					return undefined;
+				},
+			);
+
+			const mockReq = mock<WaitingWebhookRequest>({
+				params: { path: 'test-execution-id', suffix: undefined },
+				method: 'POST',
+			});
+			vi.useFakeTimers({ toFake: ['Date'] });
+			vi.setSystemTime(responseAt);
+			try {
+				await waitingWebhooks.executeWebhook(mockReq, createMockRes());
+			} finally {
+				vi.useRealTimers();
+			}
+
+			expect(mockEventService.emit).toHaveBeenCalledTimes(1);
+			expect(mockEventService.emit).toHaveBeenCalledWith(
+				'execution-resumed',
+				expect.objectContaining({
+					executionId: 'test-execution-id',
+					workflowId: 'workflow-id',
+					responseAt,
+				}),
+			);
+		});
+
+		it('should not emit when the resume request fails before the execution resumes', async () => {
+			mockWebhookService.getNodeWebhooks.mockReturnValue([
+				{
+					httpMethod: 'POST',
+					path: '',
+					webhookDescription: {
+						restartWebhook: true,
+						httpMethod: 'POST',
+						name: 'default',
+						path: '',
+						nodeType: undefined,
+					} as any,
+				},
+			] as any);
+			vi.spyOn(WebhookHelpers, 'executeWebhook').mockImplementation(
+				async (_w, _wd, _wfd, _wsn, _m, _pr, _red, _eid, _req, _res, callback) => {
+					callback(new Error('Workflow Webhook Error: Workflow could not be started!'), {});
+					return undefined;
+				},
+			);
+
+			const mockReq = mock<WaitingWebhookRequest>({
+				params: { path: 'test-execution-id', suffix: undefined },
+				method: 'POST',
+			});
+			await expect(waitingWebhooks.executeWebhook(mockReq, createMockRes())).rejects.toThrow(
+				'Workflow could not be started',
+			);
+
+			expect(mockEventService.emit).not.toHaveBeenCalledWith(
+				'execution-resumed',
+				expect.anything(),
+			);
+		});
+
+		it('should not emit when no matching webhook found', async () => {
+			mockWebhookService.getNodeWebhooks.mockReturnValue([]);
+
+			const mockReq = mock<WaitingWebhookRequest>({
+				params: { path: 'test-execution-id', suffix: undefined },
+				method: 'POST',
+			});
+			await expect(waitingWebhooks.executeWebhook(mockReq, createMockRes())).rejects.toThrowError(
+				NotFoundError,
+			);
+
+			expect(mockEventService.emit).not.toHaveBeenCalledWith(
+				'execution-resumed',
+				expect.anything(),
+			);
+		});
+
+		it('should not emit for send-and-wait already-responded requests', async () => {
+			const sendAndWaitNodeId = 'send-and-wait-node-id';
+			executionPersistence.findSingleExecution.mockResolvedValue(
+				createMockExecution({
+					nodeType: 'n8n-nodes-base.sendAndWait',
+					nodeName: 'SendAndWaitNode',
+					nodeId: sendAndWaitNodeId,
+					nodeParameters: { operation: SEND_AND_WAIT_OPERATION },
+				}),
+			);
+			mockWebhookService.getNodeWebhooks.mockReturnValue([]);
+
+			const mockReq = mock<WaitingWebhookRequest>({
+				params: { path: 'test-execution-id', suffix: sendAndWaitNodeId },
+				method: 'POST',
+			});
+			const result = await waitingWebhooks.executeWebhook(mockReq, createMockRes());
+
+			expect(result).toEqual({ noWebhookResponse: true });
+			expect(mockEventService.emit).not.toHaveBeenCalledWith(
+				'execution-resumed',
+				expect.anything(),
+			);
+		});
+
+		it('should not emit for form-resume execution (redirected, not resumed here)', async () => {
+			executionPersistence.findSingleExecution.mockResolvedValue(
+				createMockExecution({
+					nodeType: 'n8n-nodes-base.wait',
+					nodeName: 'WaitNode',
+					nodeId: 'node-id',
+					nodeParameters: { resume: 'form' },
+				}),
+			);
+
+			const mockReq = mock<WaitingWebhookRequest>({
+				params: { path: 'test-execution-id', suffix: undefined },
+				method: 'GET',
+				originalUrl: '/webhook-waiting/test-execution-id?signature=abc',
+			});
+			await waitingWebhooks.executeWebhook(mockReq, createMockRes());
+
+			expect(mockEventService.emit).not.toHaveBeenCalledWith(
+				'execution-resumed',
+				expect.anything(),
+			);
+		});
+
+		it('should not emit for active send-and-wait webhook call', async () => {
+			const sendAndWaitNodeId = 'send-and-wait-node-id';
+			executionPersistence.findSingleExecution.mockResolvedValue(
+				createMockExecution({
+					nodeType: 'n8n-nodes-base.emailSend',
+					nodeName: 'SendAndWaitNode',
+					nodeId: sendAndWaitNodeId,
+					typeVersion: 2,
+					nodeParameters: { operation: SEND_AND_WAIT_OPERATION },
+				}),
+			);
+			// Webhook IS found — simulates an active send-and-wait response
+			mockWebhookService.getNodeWebhooks.mockReturnValue([
+				{
+					httpMethod: 'POST',
+					path: sendAndWaitNodeId,
+					webhookDescription: {
+						restartWebhook: true,
+						httpMethod: 'POST',
+						name: 'default',
+						path: sendAndWaitNodeId,
+						nodeType: undefined,
+					} as any,
+				},
+			] as any);
+			vi.spyOn(WebhookHelpers, 'executeWebhook').mockImplementation(
+				async (_w, _wd, _wfd, _wsn, _m, _pr, _red, _eid, _req, _res, done, _dn, options) => {
+					options?.onResume?.();
+					done(null, { noWebhookResponse: true });
+					return undefined;
+				},
+			);
+
+			const mockReq = mock<WaitingWebhookRequest>({
+				params: { path: 'test-execution-id', suffix: sendAndWaitNodeId },
+				method: 'POST',
+			});
+			await waitingWebhooks.executeWebhook(mockReq, createMockRes());
+
+			expect(mockEventService.emit).not.toHaveBeenCalledWith(
+				'execution-resumed',
+				expect.anything(),
+			);
+		});
+
+		it('should not emit for a matched form webhook', async () => {
+			const waitingForms = new WaitingForms(
+				mock(),
+				mock(),
+				executionPersistence,
+				mockWebhookService,
+				mockInstanceSettings,
+				mockEventService,
+				mockEndpointsConfig,
+			);
+			executionPersistence.findSingleExecution.mockResolvedValue(
+				createMockExecution({
+					nodeType: 'n8n-nodes-base.wait',
+					nodeName: 'WaitNode',
+					nodeId: 'node-id',
+					nodeParameters: { resume: 'form' },
+				}),
+			);
+			mockWebhookService.getNodeWebhooks.mockReturnValue([
+				mock<IWebhookData>({
+					httpMethod: 'POST',
+					path: '',
+					webhookDescription: {
+						restartWebhook: true,
+						httpMethod: 'POST',
+						name: 'default',
+						path: '',
+						nodeType: 'form',
+					},
+				}),
+			]);
+			vi.spyOn(WebhookHelpers, 'executeWebhook').mockImplementation(
+				async (_w, _wd, _wfd, _wsn, _m, _pr, _red, _eid, _req, _res, callback, _dn, options) => {
+					options?.onResume?.();
+					callback(null, { noWebhookResponse: true });
+					return undefined;
+				},
+			);
+
+			await waitingForms.executeWebhook(
+				mock<WaitingWebhookRequest>({
+					params: { path: 'test-execution-id', suffix: undefined },
+					method: 'POST',
+				}),
+				createMockRes(),
+			);
+
+			expect(WebhookHelpers.executeWebhook).toHaveBeenCalledTimes(1);
+			expect(mockEventService.emit).not.toHaveBeenCalledWith(
+				'execution-resumed',
+				expect.anything(),
+			);
 		});
 	});
 });

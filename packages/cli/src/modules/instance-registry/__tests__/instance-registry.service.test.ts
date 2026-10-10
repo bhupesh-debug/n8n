@@ -1,12 +1,62 @@
 import type { InstanceRegistration } from '@n8n/api-types';
 import type { Logger } from '@n8n/backend-common';
-import type { ExecutionsConfig } from '@n8n/config';
+import type { ExecutionsConfig, ScalingModeConfig } from '@n8n/config';
+import { WorkerPoolConfig } from '@n8n/config';
+import { Container } from '@n8n/di';
 import type { InstanceSettings } from 'n8n-core';
-import { mock } from 'jest-mock-extended';
+import { mock } from 'vitest-mock-extended';
 
 import { InstanceRegistryService } from '../instance-registry.service';
-import type { MemoryInstanceStorage } from '../storage/memory-storage';
 import { REGISTRY_CONSTANTS } from '../instance-registry.types';
+import type { InstanceStorage } from '../storage/instance-storage.interface';
+import type { MemoryInstanceStorage } from '../storage/memory-storage';
+import { RedisInstanceStorage } from '../storage/redis-instance-storage';
+
+vi.mock('../storage/redis-instance-storage', () => {
+	class MockRedisStorage implements InstanceStorage {
+		readonly kind = 'redis' as const;
+
+		private registrations = new Map<string, InstanceRegistration>();
+
+		// Match the real class's constructor shape so callers can instantiate
+		// without type juggling. Arguments are unused in the mock.
+		constructor(..._args: unknown[]) {}
+
+		async register(registration: InstanceRegistration) {
+			this.registrations.set(registration.instanceKey, registration);
+		}
+
+		async heartbeat(registration: InstanceRegistration) {
+			this.registrations.set(registration.instanceKey, registration);
+		}
+
+		async unregister(instanceKey: string) {
+			this.registrations.delete(instanceKey);
+		}
+
+		async getAllRegistrations() {
+			return [...this.registrations.values()];
+		}
+
+		async getRegistration(instanceKey: string) {
+			return this.registrations.get(instanceKey) ?? null;
+		}
+
+		async getLastKnownState() {
+			return new Map<string, InstanceRegistration>();
+		}
+
+		async saveLastKnownState() {}
+
+		async cleanupStaleMembers() {
+			return 0;
+		}
+
+		async destroy() {}
+	}
+
+	return { RedisInstanceStorage: MockRedisStorage };
+});
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -22,6 +72,11 @@ const makeInstanceSettings = (overrides: Partial<InstanceSettings> = {}) =>
 const makeExecutionsConfig = (mode: 'regular' | 'queue' = 'regular') =>
 	mock<ExecutionsConfig>({ mode });
 
+const makeScalingModeConfig = (poolName: string = '', enabled: boolean = true) => {
+	const workerPool = Object.assign(new WorkerPoolConfig(), { name: poolName, enabled });
+	return mock<ScalingModeConfig>({ workerPool });
+};
+
 const makeLogger = () => {
 	const logger = mock<Logger>();
 	logger.scoped.mockReturnValue(logger);
@@ -33,7 +88,7 @@ describe('InstanceRegistryService', () => {
 	let logger: ReturnType<typeof makeLogger>;
 
 	beforeEach(() => {
-		jest.useFakeTimers();
+		vi.useFakeTimers();
 		logger = makeLogger();
 	});
 
@@ -42,17 +97,21 @@ describe('InstanceRegistryService', () => {
 		try {
 			await service?.shutdown();
 		} catch {}
-		jest.useRealTimers();
-		jest.restoreAllMocks();
+		Container.reset();
+		vi.useRealTimers();
+		vi.restoreAllMocks();
 	});
 
 	const createService = (
 		settingsOverrides: Partial<InstanceSettings> = {},
 		executionMode: 'regular' | 'queue' = 'regular',
+		poolName: string = '',
+		poolsEnabled: boolean = true,
 	) =>
 		new InstanceRegistryService(
 			makeInstanceSettings(settingsOverrides),
 			makeExecutionsConfig(executionMode),
+			makeScalingModeConfig(poolName, poolsEnabled),
 			logger,
 		);
 
@@ -71,6 +130,42 @@ describe('InstanceRegistryService', () => {
 			await service.init();
 
 			expect(service.storageBackend).toBe('memory');
+		});
+
+		describe('redis selection', () => {
+			const bindRedisStub = () => {
+				// The vi.mock above replaces RedisInstanceStorage with a stub
+				// class whose constructor accepts any args.
+				const MockCtor = RedisInstanceStorage as unknown as new () => RedisInstanceStorage;
+				Container.set(RedisInstanceStorage, new MockCtor());
+			};
+
+			it('should select redis storage when isMultiMain', async () => {
+				bindRedisStub();
+				service = createService({ isMultiMain: true }, 'regular');
+
+				await service.init();
+
+				expect(service.storageBackend).toBe('redis');
+			});
+
+			it('should select redis storage in queue mode even when not multi-main', async () => {
+				bindRedisStub();
+				service = createService({ isMultiMain: false }, 'queue');
+
+				await service.init();
+
+				expect(service.storageBackend).toBe('redis');
+			});
+
+			it('should select redis storage when multi-main and queue mode', async () => {
+				bindRedisStub();
+				service = createService({ isMultiMain: true }, 'queue');
+
+				await service.init();
+
+				expect(service.storageBackend).toBe('redis');
+			});
 		});
 	});
 
@@ -140,93 +235,74 @@ describe('InstanceRegistryService', () => {
 				}),
 			);
 		});
+
+		it('should not start a heartbeat timer', async () => {
+			service = createService();
+			await service.init();
+			const storage = (service as unknown as { storage: MemoryInstanceStorage }).storage;
+			const heartbeatSpy = vi.spyOn(storage, 'heartbeat');
+
+			await vi.advanceTimersByTimeAsync(REGISTRY_CONSTANTS.HEARTBEAT_INTERVAL_MS * 3);
+
+			expect(heartbeatSpy).not.toHaveBeenCalled();
+		});
 	});
 
 	describe('heartbeat', () => {
-		it('should update storage after heartbeat interval', async () => {
+		it('should refresh lastSeen in storage', async () => {
 			service = createService();
 			await service.init();
+			const [before] = await service.getAllInstances();
 
-			const regBefore = await service.getAllInstances();
-			const lastSeenBefore = regBefore[0].lastSeen;
+			vi.advanceTimersByTime(1_000);
+			await service.heartbeat();
 
-			// Advance past heartbeat interval
-			await jest.advanceTimersByTimeAsync(REGISTRY_CONSTANTS.HEARTBEAT_INTERVAL_MS);
-
-			const regAfter = await service.getAllInstances();
-			expect(regAfter[0].lastSeen).toBeGreaterThanOrEqual(lastSeenBefore);
+			const [after] = await service.getAllInstances();
+			expect(after.lastSeen).toBeGreaterThan(before.lastSeen);
 		});
 
 		it('should preserve registeredAt across heartbeats', async () => {
 			service = createService();
 			await service.init();
+			const [before] = await service.getAllInstances();
 
-			const regBefore = await service.getAllInstances();
-			const registeredAt = regBefore[0].registeredAt;
+			vi.advanceTimersByTime(1_000);
+			await service.heartbeat();
 
-			await jest.advanceTimersByTimeAsync(REGISTRY_CONSTANTS.HEARTBEAT_INTERVAL_MS);
-
-			const regAfter = await service.getAllInstances();
-			expect(regAfter[0].registeredAt).toBe(registeredAt);
+			const [after] = await service.getAllInstances();
+			expect(after.registeredAt).toBe(before.registeredAt);
 		});
 
-		it('should continue after heartbeat failure', async () => {
+		it('should write the live instanceRole to storage', async () => {
+			const settings = makeInstanceSettings({ instanceRole: 'unset' });
+			service = new InstanceRegistryService(
+				settings,
+				makeExecutionsConfig(),
+				makeScalingModeConfig(),
+				logger,
+			);
+			await service.init();
+
+			Object.defineProperty(settings, 'instanceRole', { value: 'leader', writable: true });
+			await service.heartbeat();
+
+			const [registration] = await service.getAllInstances();
+			expect(registration.instanceRole).toBe('leader');
+		});
+
+		it('should let a storage failure reach the caller', async () => {
 			service = createService();
 			await service.init();
-
-			// Access the storage via getAllInstances to get a reference for spying
-			// We need to spy on the storage's heartbeat method
 			const storage = (service as unknown as { storage: MemoryInstanceStorage }).storage;
-			const heartbeatSpy = jest
-				.spyOn(storage, 'heartbeat')
-				.mockRejectedValueOnce(new Error('Redis down'));
+			const error = new Error('Redis down');
+			vi.spyOn(storage, 'heartbeat').mockRejectedValueOnce(error);
 
-			await jest.advanceTimersByTimeAsync(REGISTRY_CONSTANTS.HEARTBEAT_INTERVAL_MS);
-
-			expect(logger.warn).toHaveBeenCalledWith('Heartbeat failed', expect.any(Object));
-
-			// Restore and verify heartbeat continues
-			heartbeatSpy.mockRestore();
-			await jest.advanceTimersByTimeAsync(REGISTRY_CONSTANTS.HEARTBEAT_INTERVAL_MS);
-
-			const regs = await service.getAllInstances();
-			expect(regs).toHaveLength(1);
-		});
-
-		it('should reflect instanceRole changes in heartbeat', async () => {
-			const settings = makeInstanceSettings({ instanceRole: 'unset' });
-			service = new InstanceRegistryService(settings, makeExecutionsConfig(), logger);
-			await service.init();
-
-			// Simulate role change (e.g., leader election completed)
-			Object.defineProperty(settings, 'instanceRole', {
-				value: 'leader',
-				writable: true,
-			});
-
-			await jest.advanceTimersByTimeAsync(REGISTRY_CONSTANTS.HEARTBEAT_INTERVAL_MS);
-
-			const local = service.getLocalInstance();
-			expect(local.instanceRole).toBe('leader');
+			await expect(service.heartbeat()).rejects.toBe(error);
+			expect(logger.warn).not.toHaveBeenCalled();
 		});
 	});
 
 	describe('shutdown', () => {
-		it('should stop heartbeat timer', async () => {
-			service = createService();
-			await service.init();
-
-			const storage = (service as unknown as { storage: MemoryInstanceStorage }).storage;
-
-			await service.shutdown();
-
-			const heartbeatSpy = jest.spyOn(storage, 'heartbeat');
-			await jest.advanceTimersByTimeAsync(REGISTRY_CONSTANTS.HEARTBEAT_INTERVAL_MS * 3);
-
-			expect(heartbeatSpy).not.toHaveBeenCalled();
-			heartbeatSpy.mockRestore();
-		});
-
 		it('should unregister from storage', async () => {
 			service = createService();
 			await service.init();
@@ -244,7 +320,7 @@ describe('InstanceRegistryService', () => {
 			await service.init();
 
 			const storage = (service as unknown as { storage: MemoryInstanceStorage }).storage;
-			const destroySpy = jest.spyOn(storage, 'destroy');
+			const destroySpy = vi.spyOn(storage, 'destroy');
 
 			await service.shutdown();
 
@@ -257,7 +333,7 @@ describe('InstanceRegistryService', () => {
 			await service.init();
 
 			const storage = (service as unknown as { storage: MemoryInstanceStorage }).storage;
-			jest.spyOn(storage, 'unregister').mockRejectedValueOnce(new Error('fail'));
+			vi.spyOn(storage, 'unregister').mockRejectedValueOnce(new Error('fail'));
 
 			await expect(service.shutdown()).resolves.toBeUndefined();
 			expect(logger.warn).toHaveBeenCalledWith(
@@ -290,6 +366,21 @@ describe('InstanceRegistryService', () => {
 			const local = service.getLocalInstance();
 			expect(local.hostId).toBe('main-local');
 			expect(local.schemaVersion).toBe(1);
+		});
+
+		it('should read the live instanceRole when building the local registration', async () => {
+			const settings = makeInstanceSettings({ instanceRole: 'unset' });
+			service = new InstanceRegistryService(
+				settings,
+				makeExecutionsConfig(),
+				makeScalingModeConfig(),
+				logger,
+			);
+			await service.init();
+
+			Object.defineProperty(settings, 'instanceRole', { value: 'leader', writable: true });
+
+			expect(service.getLocalInstance().instanceRole).toBe('leader');
 		});
 
 		it('getLastKnownState should delegate to storage', async () => {
@@ -328,6 +419,109 @@ describe('InstanceRegistryService', () => {
 
 			const removed = await service.cleanupStaleMembers();
 			expect(removed).toBe(0);
+		});
+	});
+
+	describe('poolName', () => {
+		it('records poolName on worker registration when pool is set', async () => {
+			service = createService({ instanceType: 'worker', instanceRole: 'unset' }, 'queue', 'gpu');
+
+			await service.init();
+			const [reg] = await service.getAllInstances();
+
+			expect(reg.poolName).toBe('gpu');
+		});
+
+		it('records empty poolName on worker registration when pool is unset', async () => {
+			service = createService({ instanceType: 'worker', instanceRole: 'unset' }, 'queue');
+
+			await service.init();
+			const [reg] = await service.getAllInstances();
+
+			expect(reg.poolName).toBe('');
+		});
+
+		it('records empty poolName on worker registration when pool is set but pools are disabled', async () => {
+			service = createService(
+				{ instanceType: 'worker', instanceRole: 'unset' },
+				'queue',
+				'gpu',
+				false,
+			);
+
+			await service.init();
+			const [reg] = await service.getAllInstances();
+
+			expect(reg.poolName).toBe('');
+		});
+
+		it('omits poolName on main registration even when config has a pool', async () => {
+			service = createService({ instanceType: 'main', instanceRole: 'leader' }, 'regular', 'gpu');
+
+			await service.init();
+			const [reg] = await service.getAllInstances();
+
+			expect(reg.poolName).toBeUndefined();
+		});
+
+		it('omits poolName on webhook registration even when config has a pool', async () => {
+			service = createService({ instanceType: 'webhook', instanceRole: 'unset' }, 'regular', 'gpu');
+
+			await service.init();
+			const [reg] = await service.getAllInstances();
+
+			expect(reg.poolName).toBeUndefined();
+		});
+	});
+
+	describe('storage failures', () => {
+		const storageOf = (s: InstanceRegistryService): InstanceStorage =>
+			(s as unknown as { storage: InstanceStorage }).storage;
+
+		it('getAllInstances returns an empty list when the storage read fails', async () => {
+			service = createService();
+			await service.init();
+			vi.spyOn(storageOf(service), 'getAllRegistrations').mockRejectedValueOnce(
+				new Error('Redis down'),
+			);
+
+			await expect(service.getAllInstances()).resolves.toEqual([]);
+			expect(logger.warn).toHaveBeenCalledWith(
+				'Failed to get all registrations',
+				expect.any(Object),
+			);
+		});
+
+		it('getLastKnownState returns an empty map when the storage read fails', async () => {
+			service = createService();
+			await service.init();
+			vi.spyOn(storageOf(service), 'getLastKnownState').mockRejectedValueOnce(
+				new Error('Redis down'),
+			);
+
+			await expect(service.getLastKnownState()).resolves.toEqual(new Map());
+			expect(logger.warn).toHaveBeenCalledWith(
+				'Failed to get last known state',
+				expect.any(Object),
+			);
+		});
+
+		it('readClusterState rejects when the registrations read fails', async () => {
+			service = createService();
+			await service.init();
+			const error = new Error('Redis down');
+			vi.spyOn(storageOf(service), 'getAllRegistrations').mockRejectedValueOnce(error);
+
+			await expect(service.readClusterState()).rejects.toBe(error);
+		});
+
+		it('readClusterState rejects when the baseline read fails', async () => {
+			service = createService();
+			await service.init();
+			const error = new Error('Redis down');
+			vi.spyOn(storageOf(service), 'getLastKnownState').mockRejectedValueOnce(error);
+
+			await expect(service.readClusterState()).rejects.toBe(error);
 		});
 	});
 });

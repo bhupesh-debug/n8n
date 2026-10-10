@@ -7,6 +7,9 @@ import type {
 	INodeTypeDescription,
 	ISupplyDataFunctions,
 	SupplyData,
+	INodeProperties,
+	IExecuteSingleFunctions,
+	INodeExecutionData,
 } from 'n8n-workflow';
 
 import { getAdditionalOptions } from '../gemini-common/additional-options';
@@ -15,6 +18,24 @@ import {
 	N8nLlmTracing,
 	getConnectionHintNoticeField,
 } from '@n8n/ai-utilities';
+import { shouldIncludeGoogleModel } from '@n8n/ai-utilities/model-discovery';
+
+import { MODEL_SELECTION_HINT } from '@utils/model-builder-hints';
+
+/** Drop non-chat models (embedding, image, TTS, Veo, etc.) from the dropdown. */
+async function filterChatModels(
+	this: IExecuteSingleFunctions,
+	items: INodeExecutionData[],
+): Promise<INodeExecutionData[]> {
+	return items.filter(
+		(item) =>
+			typeof item.json.name === 'string' &&
+			shouldIncludeGoogleModel({
+				name: item.json.name,
+				supportedGenerationMethods: item.json.supportedGenerationMethods,
+			}),
+	);
+}
 
 function errorDescriptionMapper(error: NodeError) {
 	if (error.description?.includes('properties: should be non-empty for OBJECT type')) {
@@ -23,6 +44,110 @@ function errorDescriptionMapper(error: NodeError) {
 
 	return error.description ?? 'Unknown error';
 }
+
+const modelRLC: INodeProperties = {
+	displayName: 'Model',
+	name: 'modelName',
+	type: 'options',
+	description:
+		'The model which will generate the completion. <a href="https://developers.generativeai.google/api/rest/generativelanguage/models/list">Learn more</a>.',
+	typeOptions: {
+		loadOptions: {
+			routing: {
+				request: {
+					method: 'GET',
+					url: '/v1beta/models',
+				},
+				output: {
+					postReceive: [
+						{
+							type: 'rootProperty',
+							properties: {
+								property: 'models',
+							},
+						},
+						{
+							type: 'filter',
+							properties: {
+								pass: "={{ !$responseItem.name.includes('embedding') && !$responseItem.name.includes('imagen') }}",
+							},
+						},
+						{
+							type: 'setKeyValue',
+							properties: {
+								name: '={{$responseItem.name}}',
+								value: '={{$responseItem.name}}',
+								description: '={{$responseItem.description}}',
+							},
+						},
+						{
+							type: 'sort',
+							properties: {
+								key: 'name',
+							},
+						},
+					],
+				},
+			},
+		},
+	},
+	routing: {
+		send: {
+			type: 'body',
+			property: 'model',
+		},
+	},
+	default: 'models/gemini-2.5-flash',
+	builderHint: {
+		// The dropdown loads through declarative routing, which the builder's resource lookup cannot call.
+		propertyHint:
+			'This node declares no model-list lookup, so its models cannot be listed, even with a connected credential. For a new choice, use current Google provider catalog information and choose a Gemini 3.x or newer model ID with the "models/" prefix. Do not choose Gemini 2.x or older. ' +
+			MODEL_SELECTION_HINT,
+	},
+};
+
+// v1.2+: same routing as modelRLC, but the dropdown drops non-chat models
+// (embedding, image) through the shared `shouldIncludeGoogleModel` predicate.
+const modelRLCV2: INodeProperties = {
+	...modelRLC,
+	default: 'models/gemini-3-flash-preview',
+	typeOptions: {
+		loadOptions: {
+			routing: {
+				request: {
+					method: 'GET',
+					url: '/v1beta/models',
+				},
+				output: {
+					postReceive: [
+						{
+							type: 'rootProperty',
+							properties: {
+								property: 'models',
+							},
+						},
+						filterChatModels,
+						{
+							type: 'setKeyValue',
+							properties: {
+								name: '={{$responseItem.name}}',
+								value: '={{$responseItem.name}}',
+								description: '={{$responseItem.description}}',
+							},
+						},
+						{
+							type: 'sort',
+							properties: {
+								key: 'name',
+							},
+						},
+					],
+				},
+			},
+		},
+	},
+};
+
 export class LmChatGoogleGemini implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Google Gemini Chat Model',
@@ -30,7 +155,7 @@ export class LmChatGoogleGemini implements INodeType {
 		name: 'lmChatGoogleGemini',
 		icon: 'file:google.svg',
 		group: ['transform'],
-		version: 1,
+		version: [1, 1.1, 1.2],
 		description: 'Chat Model Google Gemini',
 		defaults: {
 			name: 'Google Gemini Chat Model',
@@ -67,58 +192,29 @@ export class LmChatGoogleGemini implements INodeType {
 		properties: [
 			getConnectionHintNoticeField([NodeConnectionTypes.AiChain, NodeConnectionTypes.AiAgent]),
 			{
-				displayName: 'Model',
-				name: 'modelName',
-				type: 'options',
-				description:
-					'The model which will generate the completion. <a href="https://developers.generativeai.google/api/rest/generativelanguage/models/list">Learn more</a>.',
-				typeOptions: {
-					loadOptions: {
-						routing: {
-							request: {
-								method: 'GET',
-								url: '/v1beta/models',
-							},
-							output: {
-								postReceive: [
-									{
-										type: 'rootProperty',
-										properties: {
-											property: 'models',
-										},
-									},
-									{
-										type: 'filter',
-										properties: {
-											pass: "={{ !$responseItem.name.includes('embedding') }}",
-										},
-									},
-									{
-										type: 'setKeyValue',
-										properties: {
-											name: '={{$responseItem.name}}',
-											value: '={{$responseItem.name}}',
-											description: '={{$responseItem.description}}',
-										},
-									},
-									{
-										type: 'sort',
-										properties: {
-											key: 'name',
-										},
-									},
-								],
-							},
-						},
+				...modelRLC,
+				displayOptions: {
+					show: {
+						'@version': [{ _cnd: { eq: 1 } }],
 					},
 				},
-				routing: {
-					send: {
-						type: 'body',
-						property: 'model',
+			},
+			{
+				...modelRLC,
+				default: 'models/gemini-3-flash-preview',
+				displayOptions: {
+					show: {
+						'@version': [{ _cnd: { eq: 1.1 } }],
 					},
 				},
-				default: 'models/gemini-2.5-flash',
+			},
+			{
+				...modelRLCV2,
+				displayOptions: {
+					show: {
+						'@version': [{ _cnd: { gte: 1.2 } }],
+					},
+				},
 			},
 			// thinking budget not supported in @langchain/google-genai
 			// as it utilises the old google generative ai SDK

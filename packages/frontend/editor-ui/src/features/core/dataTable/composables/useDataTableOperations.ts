@@ -1,6 +1,6 @@
 import { useMessage } from '@/app/composables/useMessage';
-import { useToast } from '@/app/composables/useToast';
-import { useTelemetry } from '@/app/composables/useTelemetry';
+import { useToast } from '@n8n/composables/useToast';
+import { useTelemetry } from '@n8n/composables/useTelemetry';
 import type {
 	AddColumnResponse,
 	DataTableColumn,
@@ -21,7 +21,9 @@ import { MODAL_CONFIRM } from '@/app/constants';
 import { isDataTableValue, isAGGridCellType } from '@/features/core/dataTable/typeGuards';
 import { useDataTableTypes } from '@/features/core/dataTable/composables/useDataTableTypes';
 import { areValuesEqual } from '@/features/core/dataTable/utils/typeUtils';
+import { isUnsafeNumberValue } from '@/features/core/dataTable/utils/columnUtils';
 import { ResponseError } from '@n8n/rest-api-client';
+import { escapeHtml } from '@/app/utils/htmlUtils';
 
 export type UseDataTableOperationsParams = {
 	colDefs: Ref<ColDef[]>;
@@ -48,6 +50,7 @@ export type UseDataTableOperationsParams = {
 	currentSortOrder: Ref<string | null>;
 	currentFilterJSON?: Ref<string | undefined>;
 	searchQuery?: Ref<string | undefined>;
+	readOnly?: Ref<boolean>;
 	handleClearSelection: () => void;
 	selectedRowIds: Ref<Set<number>>;
 	handleCopyFocusedCell: (params: CellKeyDownEvent<DataTableRow>) => Promise<void>;
@@ -75,6 +78,7 @@ export const useDataTableOperations = ({
 	currentSortOrder,
 	currentFilterJSON,
 	searchQuery,
+	readOnly = ref(false),
 	handleClearSelection,
 	selectedRowIds,
 	handleCopyFocusedCell,
@@ -83,7 +87,7 @@ export const useDataTableOperations = ({
 	const toast = useToast();
 	const message = useMessage();
 	const dataTableStore = useDataTableStore();
-	const contentLoading = ref(false);
+	const contentLoading = ref(true);
 	const telemetry = useTelemetry();
 	const dataTableTypes = useDataTableTypes();
 
@@ -110,12 +114,13 @@ export const useDataTableOperations = ({
 	};
 
 	async function onDeleteColumn(columnId: string) {
+		if (readOnly.value) return;
 		const columnToDelete = colDefs.value.find((col) => col.colId === columnId);
 		if (!columnToDelete) return;
 
 		const promptResponse = await message.confirm(
 			i18n.baseText('dataTable.deleteColumn.confirm.message', {
-				interpolate: { name: columnToDelete.headerName ?? '' },
+				interpolate: { name: escapeHtml(columnToDelete.headerName ?? '') },
 			}),
 			i18n.baseText('dataTable.deleteColumn.confirm.title'),
 			{
@@ -124,7 +129,7 @@ export const useDataTableOperations = ({
 			},
 		);
 
-		if (promptResponse !== MODAL_CONFIRM) {
+		if (promptResponse !== MODAL_CONFIRM || readOnly.value) {
 			return;
 		}
 
@@ -152,6 +157,7 @@ export const useDataTableOperations = ({
 	}
 
 	async function onRenameColumn(columnId: string, newName: string): Promise<void> {
+		if (readOnly.value) return;
 		const columnToRename = colDefs.value.find((col) => col.colId === columnId);
 		if (!columnToRename) return;
 
@@ -201,6 +207,7 @@ export const useDataTableOperations = ({
 	}
 
 	async function onAddColumn(column: DataTableColumnCreatePayload): Promise<AddColumnResponse> {
+		if (readOnly.value) return { success: false };
 		try {
 			const newColumn = await dataTableStore.addDataTableColumn(dataTableId, projectId, column);
 			addGridColumn(newColumn);
@@ -226,6 +233,7 @@ export const useDataTableOperations = ({
 
 	const onColumnMoved = async (moveEvent: ColumnMovedEvent) => {
 		if (
+			readOnly.value ||
 			!moveEvent.finished ||
 			moveEvent.source !== 'uiColumnMoved' ||
 			moveEvent.toIndex === undefined ||
@@ -303,6 +311,13 @@ export const useDataTableOperations = ({
 				column_id: colDef.colId,
 				column_type: colDef.cellDataType,
 			});
+			if (isUnsafeNumberValue(value)) {
+				toast.showMessage({
+					title: i18n.baseText('dataTable.updateRow.numberPrecisionWarning.title'),
+					message: i18n.baseText('dataTable.updateRow.numberPrecisionWarning.message'),
+					type: 'warning',
+				});
+			}
 		} catch (error) {
 			// Revert cell to original value if the update fails
 			const validOldValue = isDataTableValue(oldValue) ? oldValue : null;
@@ -319,7 +334,7 @@ export const useDataTableOperations = ({
 		}
 	};
 
-	async function fetchDataTableRows() {
+	async function fetchDataTableRows(): Promise<boolean> {
 		try {
 			contentLoading.value = true;
 
@@ -336,8 +351,10 @@ export const useDataTableOperations = ({
 			setTotalItems(fetchedRows.count);
 			setGridData({ rowData: rowData.value });
 			handleClearSelection();
+			return true;
 		} catch (error) {
 			toast.showError(error, i18n.baseText('dataTable.fetchContent.error'));
+			return false;
 		} finally {
 			contentLoading.value = false;
 		}

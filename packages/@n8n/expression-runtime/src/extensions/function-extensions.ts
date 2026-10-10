@@ -1,5 +1,6 @@
 import { average as aAverage } from './array-extensions';
 import { ExpressionExtensionError } from './expression-extension-error';
+import { defineField } from './utils';
 
 const min = Math.min;
 const max = Math.max;
@@ -21,14 +22,17 @@ const numberList = (start: number, end: number): number[] => {
 };
 
 const zip = (keys: unknown[], values: unknown[]): unknown => {
+	if (!Array.isArray(keys) || !Array.isArray(values)) {
+		throw new ExpressionExtensionError('keys and values must be arrays');
+	}
 	if (keys.length !== values.length) {
 		throw new ExpressionExtensionError('keys and values not of equal length');
 	}
-	return keys.reduce((p, c, i) => {
-		// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-explicit-any
-		(p as any)[c as any] = values[i];
-		return p;
-	}, {});
+	const result: Record<string, unknown> = {};
+	for (let i = 0; i < keys.length; i++) {
+		defineField(result, keys[i] as PropertyKey, values[i]);
+	}
+	return result;
 };
 
 const average = (...args: number[]) => {
@@ -38,6 +42,19 @@ const average = (...args: number[]) => {
 const not = (value: unknown): boolean => {
 	return !value;
 };
+
+function toPathSegment(input: unknown): string {
+	if (input === null || input === undefined) {
+		throw new ExpressionExtensionError('Invalid identifier: a value is required');
+	}
+
+	const value = String(input);
+	if (value === '' || value === '.' || value === '..') {
+		throw new ExpressionExtensionError(`Invalid identifier: "${value}" is not allowed`);
+	}
+
+	return encodeURIComponent(value);
+}
 
 function ifEmpty<T, V>(value: V, defaultValue: T) {
 	if (arguments.length !== 2) {
@@ -72,7 +89,8 @@ ifEmpty.doc = {
 		{ name: 'value', type: 'any' },
 		{ name: 'defaultValue', type: 'any' },
 	],
-	docURL: 'https://docs.n8n.io/code/builtin/convenience',
+	docURL:
+		'https://docs.n8n.io/build/work-with-data/transform-data/expression-reference/root#dollarifempty',
 };
 
 export const extendedFunctions = {
@@ -82,6 +100,7 @@ export const extendedFunctions = {
 	average,
 	numberList,
 	zip,
+	toPathSegment,
 	$min: min,
 	$max: max,
 	$average: average,

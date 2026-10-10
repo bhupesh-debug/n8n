@@ -6,20 +6,26 @@ import { getResourcePermissions } from '../get-resource-permissions.ee';
 describe('permissions', () => {
 	it('getResourcePermissions for empty scopes', () => {
 		expect(getResourcePermissions()).toEqual({
+			agent: {},
 			aiAssistant: {},
+			aiPreference: {},
+			projectAiPreference: {},
 			annotationTag: {},
 			auditLogs: {},
 			banner: {},
 			community: {},
 			communityPackage: {},
 			credential: {},
+			credentialTypePolicy: {},
 			externalSecretsProvider: {},
 			externalSecret: {},
 			eventBusDestination: {},
 			execution: {},
+			testRun: {},
 			ldap: {},
 			license: {},
 			logStreaming: {},
+			nodeTypePolicy: {},
 			oidc: {},
 			orchestration: {},
 			project: {},
@@ -28,6 +34,7 @@ describe('permissions', () => {
 			securityAudit: {},
 			securitySettings: {},
 			sourceControl: {},
+			gitConnection: {},
 			tag: {},
 			user: {},
 			variable: {},
@@ -45,9 +52,12 @@ describe('permissions', () => {
 			chatHubAgent: {},
 			breakingChanges: {},
 			apiKey: {},
+			encryptionKey: {},
 			credentialResolver: {},
 			instanceAi: {},
 			roleMappingRule: {},
+			otel: {},
+			scim: {},
 		});
 	});
 	it('getResourcePermissions', () => {
@@ -87,7 +97,10 @@ describe('permissions', () => {
 		];
 
 		const permissionRecord: PermissionsRecord = {
+			agent: {},
 			aiAssistant: {},
+			aiPreference: {},
+			projectAiPreference: {},
 			annotationTag: {},
 			auditLogs: {},
 			banner: {},
@@ -102,6 +115,7 @@ describe('permissions', () => {
 				share: true,
 				update: true,
 			},
+			credentialTypePolicy: {},
 			eventBusDestination: {
 				list: true,
 				test: true,
@@ -111,6 +125,7 @@ describe('permissions', () => {
 			ldap: {},
 			license: {},
 			logStreaming: {},
+			nodeTypePolicy: {},
 			orchestration: {},
 			project: {
 				list: true,
@@ -124,6 +139,7 @@ describe('permissions', () => {
 			securityAudit: {},
 			securitySettings: {},
 			sourceControl: {},
+			gitConnection: {},
 			tag: {
 				create: true,
 				list: true,
@@ -160,6 +176,7 @@ describe('permissions', () => {
 			},
 			dataTable: {},
 			execution: {},
+			testRun: {},
 			workflowTags: {},
 			role: {},
 			chatHub: {},
@@ -170,9 +187,12 @@ describe('permissions', () => {
 			apiKey: {
 				manage: true,
 			},
+			encryptionKey: {},
 			credentialResolver: {},
 			instanceAi: {},
 			roleMappingRule: {},
+			otel: {},
+			scim: {},
 		};
 
 		expect(getResourcePermissions(scopes)).toEqual(permissionRecord);

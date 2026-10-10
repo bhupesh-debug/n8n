@@ -2,26 +2,27 @@
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
 /* eslint-disable @typescript-eslint/unbound-method */
 import { ChatOpenAI } from '@langchain/openai';
-import { makeN8nLlmFailedAttemptHandler, N8nLlmTracing, getProxyAgent } from '@n8n/ai-utilities';
+import { makeN8nLlmFailedAttemptHandler, getProxyAgent, aiClientFetch } from '@n8n/ai-utilities';
 import { createMockExecuteFunction } from 'n8n-nodes-base/test/nodes/Helpers';
 import type { INode, ISupplyDataFunctions } from 'n8n-workflow';
+import type { Mocked } from 'vitest';
 
 import { LmChatAlibabaCloud } from '../LmChatAlibabaCloud.node';
 
-jest.mock('@langchain/openai');
-jest.mock('@n8n/ai-utilities');
+vi.mock('@langchain/openai');
+vi.mock('@n8n/ai-utilities');
 
-const MockedChatOpenAI = jest.mocked(ChatOpenAI);
-const MockedN8nLlmTracing = jest.mocked(N8nLlmTracing);
-const mockedMakeN8nLlmFailedAttemptHandler = jest.mocked(makeN8nLlmFailedAttemptHandler);
-const mockedGetProxyAgent = jest.mocked(getProxyAgent);
+const MockedChatOpenAI = vi.mocked(ChatOpenAI);
+const mockedMakeN8nLlmFailedAttemptHandler = vi.mocked(makeN8nLlmFailedAttemptHandler);
+const mockedGetProxyAgent = vi.mocked(getProxyAgent);
+const mockedAiClientFetch = vi.mocked(aiClientFetch);
 
 describe('LmChatAlibabaCloud', () => {
 	let node: LmChatAlibabaCloud;
 
 	const mockNodeDef: INode = {
 		id: '1',
-		name: 'Alibaba Cloud Chat Model',
+		name: 'Qwen Cloud Chat Model',
 		typeVersion: 1,
 		type: '@n8n/n8n-nodes-langchain.lmChatAlibabaCloud',
 		position: [0, 0],
@@ -33,37 +34,37 @@ describe('LmChatAlibabaCloud', () => {
 		const ctx = createMockExecuteFunction<ISupplyDataFunctions>(
 			{},
 			nodeDef,
-		) as jest.Mocked<ISupplyDataFunctions>;
+		) as Mocked<ISupplyDataFunctions>;
 
-		ctx.getCredentials = jest.fn().mockResolvedValue({
+		ctx.getCredentials = vi.fn().mockResolvedValue({
 			apiKey: 'test-dashscope-key',
 			region: 'ap-southeast-1',
+			url: 'https://dashscope-intl.aliyuncs.com',
 		});
-		ctx.getNode = jest.fn().mockReturnValue(nodeDef);
-		ctx.getNodeParameter = jest.fn().mockImplementation((paramName: string) => {
+		ctx.getNode = vi.fn().mockReturnValue(nodeDef);
+		ctx.getNodeParameter = vi.fn().mockImplementation((paramName: string) => {
 			if (paramName === 'model') return 'qwen-plus';
 			if (paramName === 'options') return {};
 			return undefined;
 		});
 
-		MockedN8nLlmTracing.mockImplementation(() => ({}) as unknown as N8nLlmTracing);
-		mockedMakeN8nLlmFailedAttemptHandler.mockReturnValue(jest.fn());
+		mockedMakeN8nLlmFailedAttemptHandler.mockReturnValue(vi.fn());
 		mockedGetProxyAgent.mockReturnValue({} as any);
 		return ctx;
 	};
 
 	beforeEach(() => {
 		node = new LmChatAlibabaCloud();
-		jest.clearAllMocks();
+		vi.clearAllMocks();
 	});
 
 	describe('node description', () => {
 		it('should have correct node properties', () => {
 			expect(node.description).toMatchObject({
-				displayName: 'Alibaba Cloud Chat Model',
+				displayName: 'Qwen Cloud Chat Model',
 				name: 'lmChatAlibabaCloud',
 				group: ['transform'],
-				version: [1],
+				version: [1, 1.1],
 			});
 		});
 
@@ -92,6 +93,7 @@ describe('LmChatAlibabaCloud', () => {
 					callbacks: expect.arrayContaining([expect.any(Object)]),
 					onFailedAttempt: expect.any(Function),
 					configuration: expect.objectContaining({
+						fetch: mockedAiClientFetch,
 						baseURL: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
 					}),
 				}),
@@ -101,7 +103,7 @@ describe('LmChatAlibabaCloud', () => {
 
 		it('should pass options to ChatOpenAI', async () => {
 			const ctx = setupMockContext();
-			ctx.getNodeParameter = jest.fn().mockImplementation((paramName: string) => {
+			ctx.getNodeParameter = vi.fn().mockImplementation((paramName: string) => {
 				if (paramName === 'model') return 'qwen-turbo';
 				if (paramName === 'options')
 					return {
@@ -134,7 +136,7 @@ describe('LmChatAlibabaCloud', () => {
 
 		it('should set response_format in modelKwargs when responseFormat is provided', async () => {
 			const ctx = setupMockContext();
-			ctx.getNodeParameter = jest.fn().mockImplementation((paramName: string) => {
+			ctx.getNodeParameter = vi.fn().mockImplementation((paramName: string) => {
 				if (paramName === 'model') return 'qwen-plus';
 				if (paramName === 'options') return { responseFormat: 'json_object' };
 				return undefined;
@@ -172,12 +174,13 @@ describe('LmChatAlibabaCloud', () => {
 					headersTimeout: undefined,
 					bodyTimeout: undefined,
 				}),
+				ctx.helpers.getSecureEgressFilter(),
 			);
 		});
 
 		it('should configure proxy agent with custom timeout', async () => {
 			const ctx = setupMockContext();
-			ctx.getNodeParameter = jest.fn().mockImplementation((paramName: string) => {
+			ctx.getNodeParameter = vi.fn().mockImplementation((paramName: string) => {
 				if (paramName === 'model') return 'qwen-plus';
 				if (paramName === 'options') return { timeout: 120000 };
 				return undefined;
@@ -191,14 +194,16 @@ describe('LmChatAlibabaCloud', () => {
 					headersTimeout: 120000,
 					bodyTimeout: 120000,
 				}),
+				ctx.helpers.getSecureEgressFilter(),
 			);
 		});
 
 		it('should use US region base URL', async () => {
 			const ctx = setupMockContext();
-			ctx.getCredentials = jest.fn().mockResolvedValue({
+			ctx.getCredentials = vi.fn().mockResolvedValue({
 				apiKey: 'test-key',
 				region: 'us-east-1',
+				url: 'https://dashscope-us.aliyuncs.com',
 			});
 
 			await node.supplyData.call(ctx, 0);
@@ -206,6 +211,7 @@ describe('LmChatAlibabaCloud', () => {
 			expect(MockedChatOpenAI).toHaveBeenCalledWith(
 				expect.objectContaining({
 					configuration: expect.objectContaining({
+						fetch: mockedAiClientFetch,
 						baseURL: 'https://dashscope-us.aliyuncs.com/compatible-mode/v1',
 					}),
 				}),
@@ -214,10 +220,11 @@ describe('LmChatAlibabaCloud', () => {
 
 		it('should use Frankfurt region base URL with workspace ID', async () => {
 			const ctx = setupMockContext();
-			ctx.getCredentials = jest.fn().mockResolvedValue({
+			ctx.getCredentials = vi.fn().mockResolvedValue({
 				apiKey: 'test-key',
 				region: 'eu-central-1',
 				workspaceId: 'ws-abc123',
+				url: 'https://ws-abc123.eu-central-1.maas.aliyuncs.com',
 			});
 
 			await node.supplyData.call(ctx, 0);
@@ -225,6 +232,7 @@ describe('LmChatAlibabaCloud', () => {
 			expect(MockedChatOpenAI).toHaveBeenCalledWith(
 				expect.objectContaining({
 					configuration: expect.objectContaining({
+						fetch: mockedAiClientFetch,
 						baseURL: 'https://ws-abc123.eu-central-1.maas.aliyuncs.com/compatible-mode/v1',
 					}),
 				}),
@@ -233,9 +241,10 @@ describe('LmChatAlibabaCloud', () => {
 
 		it('should use China (Beijing) region base URL', async () => {
 			const ctx = setupMockContext();
-			ctx.getCredentials = jest.fn().mockResolvedValue({
+			ctx.getCredentials = vi.fn().mockResolvedValue({
 				apiKey: 'test-key',
 				region: 'cn-beijing',
+				url: 'https://dashscope.aliyuncs.com',
 			});
 
 			await node.supplyData.call(ctx, 0);
@@ -243,6 +252,7 @@ describe('LmChatAlibabaCloud', () => {
 			expect(MockedChatOpenAI).toHaveBeenCalledWith(
 				expect.objectContaining({
 					configuration: expect.objectContaining({
+						fetch: mockedAiClientFetch,
 						baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
 					}),
 				}),
@@ -251,9 +261,10 @@ describe('LmChatAlibabaCloud', () => {
 
 		it('should use Hong Kong region base URL', async () => {
 			const ctx = setupMockContext();
-			ctx.getCredentials = jest.fn().mockResolvedValue({
+			ctx.getCredentials = vi.fn().mockResolvedValue({
 				apiKey: 'test-key',
 				region: 'cn-hongkong',
+				url: 'https://cn-hongkong.dashscope.aliyuncs.com',
 			});
 
 			await node.supplyData.call(ctx, 0);
@@ -261,7 +272,28 @@ describe('LmChatAlibabaCloud', () => {
 			expect(MockedChatOpenAI).toHaveBeenCalledWith(
 				expect.objectContaining({
 					configuration: expect.objectContaining({
+						fetch: mockedAiClientFetch,
 						baseURL: 'https://cn-hongkong.dashscope.aliyuncs.com/compatible-mode/v1',
+					}),
+				}),
+			);
+		});
+
+		it('should use gateway URL when provided via credentials', async () => {
+			const ctx = setupMockContext();
+			ctx.getCredentials = vi.fn().mockResolvedValue({
+				apiKey: 'gateway-jwt-token',
+				url: 'https://gateway.example.com/v1/gateway/alibaba',
+			});
+
+			await node.supplyData.call(ctx, 0);
+
+			expect(MockedChatOpenAI).toHaveBeenCalledWith(
+				expect.objectContaining({
+					apiKey: 'gateway-jwt-token',
+					configuration: expect.objectContaining({
+						fetch: mockedAiClientFetch,
+						baseURL: 'https://gateway.example.com/v1/gateway/alibaba/compatible-mode/v1',
 					}),
 				}),
 			);
@@ -269,9 +301,10 @@ describe('LmChatAlibabaCloud', () => {
 
 		it('should throw when eu-central-1 is selected without workspaceId', async () => {
 			const ctx = setupMockContext();
-			ctx.getCredentials = jest.fn().mockResolvedValue({
+			ctx.getCredentials = vi.fn().mockResolvedValue({
 				apiKey: 'test-key',
 				region: 'eu-central-1',
+				url: 'https://undefined.eu-central-1.maas.aliyuncs.com',
 			});
 
 			await expect(node.supplyData.call(ctx, 0)).rejects.toThrow('Workspace ID');

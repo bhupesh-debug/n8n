@@ -1,19 +1,17 @@
+import { isNodesApiVersionError } from '../communityNodes.utils';
 import { useCommunityNodesStore } from '../communityNodes.store';
 import { useCredentialsStore } from '@/features/credentials/credentials.store';
 import { useNodeTypesStore } from '@/app/stores/nodeTypes.store';
-import { useUsersStore } from '@/features/settings/users/users.store';
-import { computed, nextTick, ref } from 'vue';
+import { useUsersStore } from '@n8n/stores/users.store';
+import { nextTick, ref } from 'vue';
 import { i18n } from '@n8n/i18n';
-import { useToast } from '@/app/composables/useToast';
-import { useWorkflowsStore } from '@/app/stores/workflows.store';
-import {
-	useWorkflowDocumentStore,
-	createWorkflowDocumentId,
-} from '@/app/stores/workflowDocument.store';
+import { useToast } from '@n8n/composables/useToast';
+import { injectWorkflowDocumentStore } from '@/app/stores/workflowDocument.store';
 import { useCanvasOperations } from '@/app/composables/useCanvasOperations';
 import { removePreviewToken } from '@/features/shared/nodeCreator/nodeCreator.utils';
-import { useTelemetry } from '@/app/composables/useTelemetry';
-import { useSettingsStore } from '@/app/stores/settings.store';
+import { useTelemetry } from '@n8n/composables/useTelemetry';
+import { useSettingsStore } from '@n8n/stores/settings.store';
+import { useTypeAvailabilityPoliciesStore } from '@n8n/frontend-module-type-availability-policies';
 
 type InstallNodeProps = {
 	type: 'verified' | 'unverified';
@@ -43,18 +41,14 @@ export function useInstallNode() {
 	const communityNodesStore = useCommunityNodesStore();
 	const nodeTypesStore = useNodeTypesStore();
 	const credentialsStore = useCredentialsStore();
-	const workflowsStore = useWorkflowsStore();
-	const workflowDocumentStore = computed(() =>
-		workflowsStore.workflowId
-			? useWorkflowDocumentStore(createWorkflowDocumentId(workflowsStore.workflowId))
-			: undefined,
-	);
+	const workflowDocumentStore = injectWorkflowDocumentStore();
 	const userStore = useUsersStore();
 	const loading = ref(false);
 	const toast = useToast();
 	const canvasOperations = useCanvasOperations();
 	const telemetry = useTelemetry();
 	const settingsStore = useSettingsStore();
+	const typeAvailabilityPoliciesStore = useTypeAvailabilityPoliciesStore();
 
 	const getNpmVersion = async (key: string) => {
 		const communityNodeAttributes = await nodeTypesStore.getCommunityNodeAttributes(key);
@@ -86,7 +80,6 @@ export function useInstallNode() {
 			if (props.type === 'verified' && !settingsStore.isUnverifiedPackagesEnabled) {
 				await communityNodesStore.installPackage(
 					props.packageName,
-					true,
 					await getNpmVersion(props.nodeType),
 				);
 			} else {
@@ -98,13 +91,14 @@ export function useInstallNode() {
 				nodeTypesStore.getNodeTypes(),
 				nodeTypesStore.fetchCommunityNodePreviews(),
 				credentialsStore.fetchCredentialTypes(true),
+				typeAvailabilityPoliciesStore.reload(),
 			]);
 			await nextTick();
 
 			// update parameters and webhooks for freshly installed nodes
 			// rename types from preview version to the actual version
 			const nodeType = props.nodeType;
-			const allNodes = workflowDocumentStore.value?.allNodes ?? [];
+			const allNodes = workflowDocumentStore.value.allNodes;
 			if (nodeType && allNodes.length) {
 				const nodesToUpdate = allNodes.filter((node) => node.type === removePreviewToken(nodeType));
 				canvasOperations.initializeUnknownNodes(nodesToUpdate);
@@ -115,7 +109,14 @@ export function useInstallNode() {
 			});
 			return { success: true };
 		} catch (error) {
-			toast.showError(error, i18n.baseText('settings.communityNodes.messages.install.error'));
+			toast.showError(
+				error,
+				i18n.baseText(
+					isNodesApiVersionError(error)
+						? 'settings.communityNodes.messages.install.incompatible.title'
+						: 'settings.communityNodes.messages.install.error',
+				),
+			);
 			return { success: false, error };
 		} finally {
 			loading.value = false;

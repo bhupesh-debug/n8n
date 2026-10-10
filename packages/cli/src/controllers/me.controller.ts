@@ -5,24 +5,24 @@ import {
 	UserUpdateRequestDto,
 } from '@n8n/api-types';
 import { Logger } from '@n8n/backend-common';
+import { EventService } from '@n8n/backend-services';
 import { GlobalConfig } from '@n8n/config';
-import type { User, PublicUser } from '@n8n/db';
+import type { User, PublicUser, AuthIdentity } from '@n8n/db';
 import { UserRepository, AuthenticatedRequest } from '@n8n/db';
 import { Body, createUserKeyedRateLimiter, Patch, Post, RestController } from '@n8n/decorators';
 import { plainToInstance } from 'class-transformer';
 import { Response } from 'express';
 
 import { AuthService } from '@/auth/auth.service';
-import { BadRequestError } from '@/errors/response-errors/bad-request.error';
+import { BadRequestError, ForbiddenError } from '@n8n/errors';
 import { InvalidMfaCodeError } from '@/errors/response-errors/invalid-mfa-code.error';
-import { EventService } from '@/events/event.service';
 import { ExternalHooks } from '@/external-hooks';
 import { validateEntity } from '@/generic-helpers';
 import { MfaService } from '@/mfa/mfa.service';
 import { MeRequest } from '@/requests';
 import { PasswordUtility } from '@/services/password.utility';
 import { UserService } from '@/services/user.service';
-import { isSamlLicensedAndEnabled } from '@/sso.ee/sso-helpers';
+import { getCurrentAuthenticationMethod, isSamlLicensedAndEnabled } from '@/sso.ee/sso-helpers';
 
 import { PersonalizationSurveyAnswersV4 } from './survey-answers.dto';
 
@@ -46,7 +46,7 @@ export class MeController {
 	@Patch('/')
 	async updateCurrentUser(
 		req: AuthenticatedRequest,
-		res: Response,
+		_: Response,
 		@Body payload: UserUpdateRequestDto,
 	): Promise<PublicUser> {
 		const {
@@ -57,27 +57,25 @@ export class MeController {
 		} = req.user;
 
 		if (this.isUserManagedByEnv(req.user)) {
-			throw new BadRequestError(
-				'This account is managed via environment variables and cannot be updated here',
+			throw new ForbiddenError(
+				'This account is managed via environment variables and cannot be modified through the API',
 			);
 		}
 
-		const { currentPassword, ...payloadWithoutPassword } = payload;
-		const { email, firstName, lastName } = payload;
-		const isEmailBeingChanged = email !== currentEmail;
+		const { firstName, lastName } = payload;
 		const isFirstNameChanged = firstName !== currentFirstName;
 		const isLastNameChanged = lastName !== currentLastName;
 
 		// Check if the user is authenticated via SSO - they cannot change their profile info
-		if (isEmailBeingChanged || isFirstNameChanged || isLastNameChanged) {
+		if (isFirstNameChanged || isLastNameChanged) {
 			const ssoIdentity = await this.userService.findSsoIdentity(userId);
 
-			if (ssoIdentity) {
+			if (ssoIdentity && this.isAuthIdentityActive(ssoIdentity)) {
 				this.logger.debug(
 					`Request to update user failed because ${ssoIdentity.providerType} user may not change their profile information`,
 					{
 						userId,
-						payload: payloadWithoutPassword,
+						payload,
 					},
 				);
 				throw new BadRequestError(
@@ -86,23 +84,15 @@ export class MeController {
 			}
 		}
 
-		await this.validateChangingUserEmail(req.user, payload);
-
-		await this.externalHooks.run('user.profile.beforeUpdate', [
-			userId,
-			currentEmail,
-			payloadWithoutPassword,
-		]);
+		await this.externalHooks.run('user.profile.beforeUpdate', [userId, currentEmail, payload]);
 
 		const preUpdateUser = await this.userRepository.findOneByOrFail({ id: userId });
-		await this.userService.update(userId, payloadWithoutPassword);
+		await this.userService.update(userId, payload);
 		const user = await this.userService.findUserWithAuthIdentities(userId);
 
 		this.logger.info('User updated successfully', { userId });
 
-		this.authService.issueCookie(res, user, req.authInfo?.usedMfa ?? false, req.browserId);
-
-		const changeableFields = ['email', 'firstName', 'lastName'] as const;
+		const changeableFields = ['firstName', 'lastName'] as const;
 		const fieldsChanged = changeableFields.filter(
 			(key) => key in payload && payload[key] !== preUpdateUser[key],
 		);
@@ -116,60 +106,6 @@ export class MeController {
 		return publicUser;
 	}
 
-	private async validateChangingUserEmail(currentUser: User, payload: UserUpdateRequestDto) {
-		if (!payload.email || payload.email === currentUser.email) {
-			// email is not being changed
-			return;
-		}
-		const { currentPassword: providedCurrentPassword, ...payloadWithoutPassword } = payload;
-		const { id: userId, mfaEnabled } = currentUser;
-
-		// If SAML is enabled, we don't allow the user to change their email address
-		if (isSamlLicensedAndEnabled()) {
-			this.logger.debug(
-				'Request to update user failed because SAML user may not change their email',
-				{
-					userId: currentUser.id,
-					payload: payloadWithoutPassword,
-				},
-			);
-			throw new BadRequestError('SAML user may not change their email');
-		}
-
-		if (mfaEnabled) {
-			if (!payload.mfaCode) {
-				throw new BadRequestError('Two-factor code is required to change email');
-			}
-
-			const isMfaCodeValid = await this.mfaService.validateMfa(userId, payload.mfaCode, undefined);
-			if (!isMfaCodeValid) {
-				throw new InvalidMfaCodeError();
-			}
-		} else {
-			if (currentUser.password === null) {
-				this.logger.debug('User with no password changed their email', {
-					userId: currentUser.id,
-					payload: payloadWithoutPassword,
-				});
-				return;
-			}
-
-			if (!providedCurrentPassword || typeof providedCurrentPassword !== 'string') {
-				throw new BadRequestError('Current password is required to change email');
-			}
-
-			const isProvidedPasswordCorrect = await this.passwordUtility.compare(
-				providedCurrentPassword,
-				currentUser.password,
-			);
-			if (!isProvidedPasswordCorrect) {
-				throw new BadRequestError(
-					'Unable to update profile. Please check your credentials and try again.',
-				);
-			}
-		}
-	}
-
 	private isUserManagedByEnv(user: User): boolean {
 		const { instanceSettingsLoader } = this.globalConfig;
 		return (
@@ -177,6 +113,10 @@ export class MeController {
 			!!user.email &&
 			user.email.toLowerCase() === instanceSettingsLoader.ownerEmail.toLowerCase()
 		);
+	}
+
+	private isAuthIdentityActive(authIdentity: AuthIdentity) {
+		return authIdentity.providerType === getCurrentAuthenticationMethod();
 	}
 
 	/**
@@ -194,8 +134,8 @@ export class MeController {
 		const { currentPassword, newPassword, mfaCode } = payload;
 
 		if (this.isUserManagedByEnv(user)) {
-			throw new BadRequestError(
-				'This account is managed via environment variables and cannot be updated here',
+			throw new ForbiddenError(
+				'This account is managed via environment variables and cannot be modified through the API',
 			);
 		}
 
